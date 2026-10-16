@@ -1,0 +1,14 @@
+# shard.yml
+name: plugboard
+version: 1.6.0
+
+authors:
+  - shpeckman
+
+crystal: ">= 1.21"
+
+license: MIT
+
+dependencies:
+  bytewire:
+    github: shpeckman/bytewire
