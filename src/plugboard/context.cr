@@ -2,12 +2,12 @@
 class Plugboard::Context
   include Disposable
 
-  getter app    : App
+  getter app : App
   getter parent : Context?
 
   def initialize(@app : App, @parent : Context? = nil)
-    @held     = [] of Disposable?
-    @holes    = 0
+    @held = [] of Disposable?
+    @holes = 0
     @disposed = false
   end
 
@@ -99,6 +99,10 @@ class Plugboard::Context
     own(@app.timers.add(self, span, span, block))
   end
 
+  def now : Time::Instant
+    @app.clock.now
+  end
+
   def emit(event) : Bool
     @app.emit(event)
   end
@@ -113,11 +117,11 @@ class Plugboard::Context
 
   def async(work : Proc(Token, T), &done : T -> Nil) : Disposable forall T
     @app.assert_loop
-    live  = true
+    live = true
     token = Token.new
     lease = own(Effect.new(self, -> { live = false; token.cancel; nil }))
     app = @app
-    app.workers.spawn(name: "plugboard.async") do
+    app.job do
       begin
         value = work.call(token)
         app.enqueue(-> {
@@ -184,7 +188,7 @@ class Plugboard::Context
     return if @disposed
     @app.assert_loop
     @disposed = true
-    failure   = nil.as(Exception?)
+    failure = nil.as(Exception?)
     until @held.empty?
       item = @held.pop || next
       item.slot = -1

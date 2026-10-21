@@ -1,46 +1,50 @@
 # src/plugboard/app.cr
 class Plugboard::App
-  getter output     : IO
-  getter bus        : Bus
-  getter timers     : Timers
+  getter output : IO
+  getter bus : Bus
+  getter timers : Timers
+  getter clock : Clock
   property retained : Int32
 
   getter? async_output : Bool
 
-  @root    : Context?
-  @owner   : Fiber?
+  @root : Context?
+  @owner : Fiber?
   @workers : Fiber::ExecutionContext?
-  @outbox  : Channel(Bytewire)?
-  @writer  : Fiber::ExecutionContext::Isolated?
+  @outbox : Channel(Bytewire)?
+  @writer : Fiber::ExecutionContext::Isolated?
   @failure : Exception?
+  @wake : Proc(Nil)
 
   def initialize(@output : IO, *, workers : Fiber::ExecutionContext? = nil, retained : Int32 = 1 << 20,
-                 @async_output : Bool = false)
-    @bus       = Bus.new
-    @timers    = Timers.new
-    @workers   = workers
-    @local     = Deque(Event | Action).new
-    @shared    = Deque(Event | Action).new
-    @mutex     = Sync::Mutex.new
-    @bell      = Channel(Nil).new(1)
-    @ringing   = false
-    @sessions  = [] of Session
-    @running   = Atomic(Bool).new(false)
-    @stopping  = Atomic(Bool).new(false)
-    @dirty     = false
+                 @async_output : Bool = false, @clock : Clock = Clock::SYSTEM)
+    @bus = Bus.new
+    @timers = Timers.new(@clock)
+    @workers = workers
+    @local = Deque(Event | Action).new
+    @shared = Deque(Event | Action).new
+    @mutex = Sync::Mutex.new
+    @bell = Channel(Nil).new(1)
+    @ringing = false
+    @sessions = [] of Session
+    @running = Atomic(Bool).new(false)
+    @stopping = Atomic(Bool).new(false)
+    @dirty = false
     @reporting = false
-    @buffer    = Bytewire.new
-    @scratch   = Bytewire.new(256)
-    @retained  = retained
-    @root      = nil
-    @owner     = nil
-    @spare     = Bytewire.new
-    @outbox    = nil
-    @writer    = nil
-    @lock      = Sync::Mutex.new
-    @idle      = Sync::ConditionVariable.new(@lock)
-    @writing   = false
-    @failure   = nil
+    @buffer = Bytewire.new
+    @scratch = Bytewire.new(256)
+    @retained = retained
+    @root = nil
+    @owner = nil
+    @spare = Bytewire.new
+    @outbox = nil
+    @writer = nil
+    @lock = Sync::Mutex.new
+    @idle = Sync::ConditionVariable.new(@lock)
+    @writing = false
+    @failure = nil
+    @jobs = Atomic(Int32).new(0)
+    @wake = -> { ring; nil }
   end
 
   def running? : Bool
@@ -135,11 +139,28 @@ class Plugboard::App
   end
 
   def async(&block : -> Message) : Nil
-    workers.spawn(name: "plugboard.async") do
-      post(block.call)
-    rescue ex
-      post(AsyncError.new(ex))
+    job do
+      begin
+        post(block.call)
+      rescue ex
+        post(AsyncError.new(ex))
+      end
     end
+  end
+
+  def job(&work : -> Nil) : Nil
+    @jobs.add(1)
+    workers.spawn(name: "plugboard.async") do
+      begin
+        work.call
+      ensure
+        ring if @jobs.sub(1) == 1
+      end
+    end
+  end
+
+  def jobs : Int32
+    @jobs.get
   end
 
   def async(work : Proc(T), &done : T -> Nil) : Disposable forall T
@@ -159,7 +180,7 @@ class Plugboard::App
   def report(error : Exception) : Nil
     assert_loop
     raise error if @reporting
-    event      = ErrorEvent.new(error)
+    event = ErrorEvent.new(error)
     @reporting = true
     begin
       @bus.topic(ErrorEvent).emit(event)
@@ -210,6 +231,7 @@ class Plugboard::App
     @owner = Fiber.current
     @running.set(true)
     failure = nil.as(Exception?)
+    @clock.watch(@wake)
     begin
       start_sessions
       flush
@@ -251,7 +273,7 @@ class Plugboard::App
       @shared.push(item)
       unless @ringing
         @ringing = true
-        wake     = true
+        wake = true
       end
     end
     @bell.send(nil) if wake
@@ -262,7 +284,7 @@ class Plugboard::App
     @mutex.synchronize do
       unless @ringing
         @ringing = true
-        wake     = true
+        wake = true
       end
     end
     @bell.send(nil) if wake
@@ -286,6 +308,7 @@ class Plugboard::App
   end
 
   private def shutdown(failure : Exception?) : Exception?
+    @clock.unwatch(@wake)
     @sessions.dup.reverse_each do |session|
       begin
         session.stop
@@ -316,11 +339,11 @@ class Plugboard::App
 
   private def await : Nil
     return unless @local.empty?
-    if span = @timers.delay(Time.instant)
+    if span = @timers.delay(@clock.now)
       if span > Time::Span.zero
         select
         when @bell.receive
-        when timeout(span)
+        when timeout(@clock.budget(span))
         end
       end
     else
@@ -330,7 +353,7 @@ class Plugboard::App
   end
 
   private def drain : Nil
-    @timers.each_due(Time.instant) { |timer| guard { timer.fire } }
+    @timers.each_due(@clock.now) { |timer| guard { timer.fire } }
     until @stopping.get
       if item = @local.shift?
         guard { route(item) }
@@ -376,7 +399,7 @@ class Plugboard::App
 
   private def hand_off : Nil
     busy, failure = @lock.synchronize do
-      found    = @failure
+      found = @failure
       @failure = nil
       {@writing, found}
     end
@@ -385,10 +408,10 @@ class Plugboard::App
       raise failure
     end
     return if busy || @buffer.empty?
-    outbox  = writer
-    full    = @buffer
+    outbox = writer
+    full = @buffer
     @buffer = @spare
-    @spare  = full
+    @spare = full
     @lock.synchronize { @writing = true }
     outbox.send(full)
   end
@@ -404,7 +427,7 @@ class Plugboard::App
       hand_off
     end
     failure = @lock.synchronize do
-      found    = @failure
+      found = @failure
       @failure = nil
       found
     end
@@ -413,7 +436,7 @@ class Plugboard::App
 
   private def writer : Channel(Bytewire)
     @outbox ||= begin
-      outbox  = Channel(Bytewire).new(1)
+      outbox = Channel(Bytewire).new(1)
       @writer = Fiber::ExecutionContext::Isolated.new("plugboard.writer") { pour(outbox) }
       outbox
     end

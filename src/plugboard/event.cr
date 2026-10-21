@@ -50,7 +50,7 @@ module Plugboard
   end
 
   class ErrorEvent
-    getter error    : Exception
+    getter error : Exception
     getter? handled : Bool
 
     def initialize(@error : Exception)

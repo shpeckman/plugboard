@@ -1,0 +1,6 @@
+version: 2.0
+shards:
+  bytewire:
+    git: https://github.com/shpeckman/bytewire.git
+    version: 0.6.0
+

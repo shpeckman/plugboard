@@ -2,8 +2,8 @@
 class Plugboard::Timer
   include Disposable
 
-  getter deadline     : Time::Instant
-  getter serial       : UInt64
+  getter deadline : Time::Instant
+  getter serial : UInt64
   property heap_index : Int32
 
   @action : (-> Nil)?
@@ -11,14 +11,14 @@ class Plugboard::Timer
 
   def initialize(@owner : Context, @timers : Timers, @deadline : Time::Instant,
                  @period : Time::Span?, @action : (-> Nil)?, @serial : UInt64)
-    @cancelled  = Atomic(Bool).new(false)
+    @cancelled = Atomic(Bool).new(false)
     @heap_index = -1
   end
 
   def cancel : Nil
     return if @cancelled.swap(true)
     @action = nil
-    app     = @owner.app
+    app = @owner.app
     if app.on_loop?
       detach
     else
@@ -60,14 +60,14 @@ class Plugboard::Timer
 end
 
 class Plugboard::Timers
-  def initialize
-    @heap   = [] of Timer
-    @due    = [] of Timer
+  def initialize(@clock : Clock = Clock::SYSTEM)
+    @heap = [] of Timer
+    @due = [] of Timer
     @serial = 0_u64
   end
 
   def add(owner : Context, span : Time::Span, period : Time::Span?, action : -> Nil) : Timer
-    timer = Timer.new(owner, self, Time.instant + span, period, action, @serial &+= 1)
+    timer = Timer.new(owner, self, @clock.now + span, period, action, @serial &+= 1)
     insert(timer)
     timer
   end

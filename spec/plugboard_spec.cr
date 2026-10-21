@@ -103,7 +103,7 @@ end
 
 describe Plugboard::Context do
   it "removes a plugin's registrations when it is disposed" do
-    app       = bare
+    app = bare
     collector = app.plugin(Collector)
     app.emit(Note.new(1))
     collector.dispose
@@ -113,7 +113,7 @@ describe Plugboard::Context do
   end
 
   it "disposes child plugins with their parent" do
-    app   = bare
+    app = bare
     suite = app.plugin(Suite)
     app.emit(Note.new(3))
     suite.dispose
@@ -126,7 +126,7 @@ describe Plugboard::Context do
   end
 
   it "undoes effects in reverse order" do
-    app   = bare
+    app = bare
     order = [] of Int32
     scope = app.nest
     scope.effect { -> { order << 1; nil } }
@@ -139,9 +139,9 @@ describe Plugboard::Context do
   end
 
   it "releases a single effect without touching the rest" do
-    app    = bare
-    seen   = [] of Int32
-    first  = app.on(Note) { |note| seen << note.value }
+    app = bare
+    seen = [] of Int32
+    first = app.on(Note) { |note| seen << note.value }
     second = app.on(Note) { |note| seen << note.value * 10 }
     first.dispose
     app.emit(Note.new(2))
@@ -152,10 +152,10 @@ describe Plugboard::Context do
   end
 
   it "releases one of many held items without touching the rest" do
-    app      = bare
-    scope    = app.nest
+    app = bare
+    scope = app.nest
     disposed = 0
-    effects  = Array.new(10_000) { scope.effect { -> { disposed += 1; nil } } }
+    effects = Array.new(10_000) { scope.effect { -> { disposed += 1; nil } } }
     effects[5_000].dispose
     disposed.should eq 1
     effects[4_999].slot.should be >= 0
@@ -166,10 +166,10 @@ describe Plugboard::Context do
   end
 
   it "keeps reverse teardown order after items in the middle are released" do
-    app   = bare
+    app = bare
     scope = app.nest
     order = [] of Int32
-    held  = (1..8).map { |index| scope.effect { -> { order << index; nil } } }
+    held = (1..8).map { |index| scope.effect { -> { order << index; nil } } }
     held[1].dispose
     held[2].dispose
     held[4].dispose
@@ -181,8 +181,8 @@ describe Plugboard::Context do
   end
 
   it "keeps dispatching when a listener disposes itself" do
-    app   = bare
-    seen  = [] of String
+    app = bare
+    seen = [] of String
     scope = app.nest
     scope.on(Note) do
       seen << "once"
@@ -195,7 +195,7 @@ describe Plugboard::Context do
   end
 
   it "runs interceptors in order and lets them swallow events" do
-    app  = bare
+    app = bare
     seen = [] of Int32
     app.plugin(Doubler)
     gate = app.intercept(Note) { |note, nxt| nxt.call(note) if note.value < 10 }
@@ -208,7 +208,7 @@ describe Plugboard::Context do
   end
 
   it "offers events to handlers until one takes them" do
-    app   = bare
+    app = bare
     taken = [] of String
     app.handle(Note) do |note|
       taken << "first" if note.value.even?
@@ -228,9 +228,9 @@ describe Plugboard::Context do
   end
 
   it "passes every emitted event through wildcard interceptors" do
-    app   = bare
+    app = bare
     kinds = [] of String
-    seen  = [] of Int32
+    seen = [] of Int32
     app.on(Note) { |note| seen << note.value }
     capture = app.intercept do |event, nxt|
       kinds << event.class.name
@@ -246,7 +246,7 @@ describe Plugboard::Context do
   end
 
   it "cancels timers with their scope" do
-    app   = bare
+    app = bare
     fired = [] of String
     scope = app.nest
     scope.after(20.milliseconds) { fired << "scoped" }
@@ -257,7 +257,7 @@ describe Plugboard::Context do
   end
 
   it "reports a disposal failure alongside the error that caused it" do
-    app   = bare
+    app = bare
     fault = expect_raises(Plugboard::Fault) { app.plugin(Breaker) }
     fault.primary.message.should eq "setup failed"
     fault.secondary.message.should eq "undo failed"
@@ -267,9 +267,9 @@ end
 
 describe Plugboard::Topic do
   it "owns a listener on a standalone topic" do
-    app   = bare
+    app = bare
     topic = Plugboard::Topic(Int32).new
-    seen  = [] of Int32
+    seen = [] of Int32
     scope = app.nest
     scope.on(topic) { |value| seen << value }
     topic.emit(1)
@@ -280,7 +280,7 @@ describe Plugboard::Topic do
   end
 
   it "owns a handler on a standalone topic" do
-    app   = bare
+    app = bare
     topic = Plugboard::Topic(Int32).new
     taken = [] of Int32
     lease = app.handle(topic) do |value|
@@ -296,7 +296,7 @@ describe Plugboard::Topic do
   end
 
   it "disposes a topic subscription made on a disposed scope" do
-    app   = bare
+    app = bare
     topic = Plugboard::Topic(Int32).new
     scope = app.nest
     scope.dispose
@@ -347,7 +347,7 @@ end
 
 describe Plugboard::App do
   it "starts session effects with the run loop and stops them in reverse" do
-    app   = bare
+    app = bare
     lines = [] of String
     app.session do
       lines << "a on"
@@ -366,7 +366,7 @@ describe Plugboard::App do
   end
 
   it "starts a session effect immediately when added to a running app" do
-    app   = bare
+    app = bare
     lines = [] of String
     app.after(10.milliseconds) do
       mode = app.session do
@@ -383,7 +383,7 @@ describe Plugboard::App do
 
   it "flushes the output buffer once per loop iteration and on demand" do
     output = IO::Memory.new
-    app    = Plugboard::App.new(output)
+    app = Plugboard::App.new(output)
     app.on(Note) { |note| app.buffer.str("n").int(note.value).char(';') }
     app.post(Note.new(1))
     app.post(Note.new(2))
@@ -416,9 +416,9 @@ describe Plugboard::App do
   end
 
   it "renders once per batch and only for events that are not replies" do
-    app     = bare
+    app = bare
     renders = 0
-    stops   = 0
+    stops = 0
     app.on(Plugboard::RenderEvent) { renders += 1 }
     app.on(Plugboard::StoppedEvent) { stops += 1 }
     app.post(Answer.new)
@@ -445,7 +445,7 @@ describe Plugboard::App do
   end
 
   it "queues more events than a bounded channel would hold before the loop starts" do
-    app  = bare
+    app = bare
     seen = [] of Int32
     app.on(Note) { |note| seen << note.value }
     200.times { |index| app.post(Note.new(index)) }
@@ -467,7 +467,7 @@ describe Plugboard::App do
   end
 
   it "leaves the loop promptly when stopped while loaded" do
-    app  = bare
+    app = bare
     seen = 0
     app.on(Note) { seen += 1 }
     10_000.times { |index| app.post(Note.new(index)) }
@@ -480,12 +480,12 @@ describe Plugboard::App do
   end
 
   it "keeps the loop alive while async work occupies a worker" do
-    app     = bare
+    app = bare
     release = Atomic(Bool).new(false)
-    value   = 0
+    value = 0
     app.on(Plugboard::MessageEvent) do |event|
       message = event.message
-      value   = message.value if message.is_a?(Loaded)
+      value = message.value if message.is_a?(Loaded)
     end
     app.after(20.milliseconds) { release.set(true) }
     app.async do
@@ -499,11 +499,11 @@ describe Plugboard::App do
   end
 
   it "reports an async failure as a message" do
-    app  = bare
+    app = bare
     seen = nil.as(String?)
     app.on(Plugboard::MessageEvent) do |event|
       message = event.message
-      seen    = message.error.message if message.is_a?(Plugboard::AsyncError)
+      seen = message.error.message if message.is_a?(Plugboard::AsyncError)
     end
     app.async { boom }
     cycle(app)
@@ -511,7 +511,7 @@ describe Plugboard::App do
   end
 
   it "cancels a timer from another fiber" do
-    app   = bare
+    app = bare
     fired = 0
     timer = app.every(10.milliseconds) { fired += 1 }
     spawn app.run
@@ -562,9 +562,9 @@ describe Plugboard::App do
   end
 
   it "keeps the loop running when an error listener handles the error" do
-    app    = bare
+    app = bare
     errors = [] of String
-    seen   = 0
+    seen = 0
     app.on(Plugboard::ErrorEvent) do |event|
       errors << (event.error.message || "")
       event.handle
@@ -578,12 +578,12 @@ describe Plugboard::App do
   end
 
   it "delivers a typed async result on the loop" do
-    app    = bare
-    seen   = 0
+    app = bare
+    seen = 0
     onloop = nil.as(Bool?)
     app.after(5.milliseconds) do
       app.async(-> { 21 }) do |value|
-        seen   = value * 2
+        seen = value * 2
         onloop = app.on_loop?
       end
     end
@@ -593,7 +593,7 @@ describe Plugboard::App do
   end
 
   it "drops a typed async result when the lease is disposed first" do
-    app  = bare
+    app = bare
     seen = 0
     app.after(5.milliseconds) do
       app.async(-> { 1 }) { |value| seen = value }.dispose
@@ -603,8 +603,8 @@ describe Plugboard::App do
   end
 
   it "drops a typed async result when the owning scope is disposed" do
-    app   = bare
-    seen  = 0
+    app = bare
+    seen = 0
     scope = app.nest
     app.after(5.milliseconds) do
       scope.async(-> { 1 }) { |value| seen = value }
@@ -615,9 +615,9 @@ describe Plugboard::App do
   end
 
   it "routes a typed async failure through the error policy" do
-    app    = bare
+    app = bare
     errors = [] of String
-    notes  = 0
+    notes = 0
     app.on(Plugboard::ErrorEvent) do |event|
       errors << (event.error.message || "")
       event.handle
@@ -632,16 +632,16 @@ describe Plugboard::App do
   end
 
   it "raises out of run when a typed async failure goes unhandled" do
-    app  = bare
+    app = bare
     work = Proc(Int32).new { flop }
     app.after(5.milliseconds) { app.async(work) { |value| } }
     expect_raises(Exception, "work failed") { app.run }
   end
 
   it "runs typed async work off the loop" do
-    app     = bare
+    app = bare
     release = Atomic(Bool).new(false)
-    value   = 0
+    value = 0
     work = -> {
       limit = Time.instant + 500.milliseconds
       while !release.get && Time.instant < limit
@@ -662,7 +662,7 @@ describe Plugboard::App do
 
   it "takes a worker context and a buffer threshold from the caller" do
     workers = Fiber::ExecutionContext::Concurrent.new("spec.workers")
-    app     = Plugboard::App.new(IO::Memory.new, workers: workers, retained: 4096)
+    app = Plugboard::App.new(IO::Memory.new, workers: workers, retained: 4096)
     app.workers.should be(workers)
     app.retained.should eq 4096
     app.retained = 8192
@@ -671,7 +671,7 @@ describe Plugboard::App do
 
   it "writes through a dedicated writer when async output is on" do
     output = IO::Memory.new
-    app    = Plugboard::App.new(output, async_output: true)
+    app = Plugboard::App.new(output, async_output: true)
     app.async_output?.should be_true
     app.buffer.str("frame")
     app.flush(wait: true)
@@ -681,7 +681,7 @@ describe Plugboard::App do
 
   it "keeps output written before the loop stops" do
     output = IO::Memory.new
-    app    = Plugboard::App.new(output, async_output: true)
+    app = Plugboard::App.new(output, async_output: true)
     app.on(Note) { |note| app.buffer.int(note.value) }
     app.post(Note.new(7))
     cycle(app)
@@ -689,9 +689,9 @@ describe Plugboard::App do
   end
 
   it "cancels the token of a disposed async lease" do
-    app       = bare
+    app = bare
     cancelled = Atomic(Bool).new(false)
-    called    = false
+    called = false
     work = ->(token : Plugboard::Token) {
       limit = Time.instant + 500.milliseconds
       while !token.cancelled? && Time.instant < limit
@@ -708,4 +708,3 @@ describe Plugboard::App do
     called.should be_false
   end
 end
-
