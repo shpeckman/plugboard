@@ -299,6 +299,13 @@ period, the missed ticks are skipped.
 
 A timer belongs to the scope that created it and is cancelled with that scope.
 
+Timers and the loop read time from the app's clock, a `Plugboard::Clock` passed
+as `App.new(output, clock: …)`; `Plugboard::Clock::SYSTEM` is the default. A
+clock answers `now`, says how long the loop may sleep for a deadline
+(`budget`), and calls the procs registered with `watch` when it jumps, so a
+test clock can stand still and wake the loop when it is moved. `ctx.now`
+returns the clock's current instant.
+
 ## The run loop
 
 `app.run` blocks until `app.stop` is called. Each pass does the following:
@@ -577,11 +584,12 @@ root scope.
 
 **Construction and lifecycle**
 
-`App.new(output : IO, *, workers : Fiber::ExecutionContext? = nil, retained : Int32 = 1 << 20, async_output : Bool = false) : App`  
+`App.new(output : IO, *, workers : Fiber::ExecutionContext? = nil, retained : Int32 = 1 << 20, async_output : Bool = false, clock : Clock = Clock::SYSTEM) : App`  
 Creates an app.  
 Nothing is written until `run`.  
 `workers` is where `async` blocks run; the default is a `Fiber::ExecutionContext::Parallel` named `plugboard.workers`, sized to `default_workers_count` and built on first use.  
 `async_output` moves writes to a dedicated writer thread and paces rendering to the output; see [Asynchronous output](#asynchronous-output).  
+`clock` is where timers and the loop read the time; see [Timers](#timers).  
 
 `#run : Nil`  
 Starts the sessions and runs the loop until stopped.  
@@ -641,6 +649,15 @@ Disposing the result, or the scope that owns it, drops the reply.
 
 `#async(work : Proc(Token, T), &done : T -> Nil) : Disposable`  
 As above, and passes `work` a `Token` that disposing the result cancels.  
+
+`#job(&work : -> Nil) : Nil`  
+Runs `work` on `workers`, counted in `jobs` until it returns; the loop is woken when the last job finishes. Every `async` runs through it.  
+
+`#jobs : Int32`  
+How many jobs are running right now.  
+
+`#clock : Clock`  
+The clock the app was built with.  
 
 `#pending : Int32`  
 How many events and procs are waiting to be delivered.  

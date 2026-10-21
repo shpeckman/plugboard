@@ -2,12 +2,12 @@
 class Plugboard::Context
   include Disposable
 
-  getter app : App
+  getter app    : App
   getter parent : Context?
 
   def initialize(@app : App, @parent : Context? = nil)
-    @held = [] of Disposable?
-    @holes = 0
+    @held     = [] of Disposable?
+    @holes    = 0
     @disposed = false
   end
 
@@ -117,7 +117,7 @@ class Plugboard::Context
 
   def async(work : Proc(Token, T), &done : T -> Nil) : Disposable forall T
     @app.assert_loop
-    live = true
+    live  = true
     token = Token.new
     lease = own(Effect.new(self, -> { live = false; token.cancel; nil }))
     app = @app
@@ -188,7 +188,7 @@ class Plugboard::Context
     return if @disposed
     @app.assert_loop
     @disposed = true
-    failure = nil.as(Exception?)
+    failure   = nil.as(Exception?)
     until @held.empty?
       item = @held.pop || next
       item.slot = -1
