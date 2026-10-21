@@ -60,14 +60,14 @@ class Plugboard::Timer
 end
 
 class Plugboard::Timers
-  def initialize
+  def initialize(@clock : Clock = Clock::SYSTEM)
     @heap   = [] of Timer
     @due    = [] of Timer
     @serial = 0_u64
   end
 
   def add(owner : Context, span : Time::Span, period : Time::Span?, action : -> Nil) : Timer
-    timer = Timer.new(owner, self, Time.instant + span, period, action, @serial &+= 1)
+    timer = Timer.new(owner, self, @clock.now + span, period, action, @serial &+= 1)
     insert(timer)
     timer
   end

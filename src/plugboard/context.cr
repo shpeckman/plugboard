@@ -99,6 +99,10 @@ class Plugboard::Context
     own(@app.timers.add(self, span, span, block))
   end
 
+  def now : Time::Instant
+    @app.clock.now
+  end
+
   def emit(event) : Bool
     @app.emit(event)
   end
@@ -117,7 +121,7 @@ class Plugboard::Context
     token = Token.new
     lease = own(Effect.new(self, -> { live = false; token.cancel; nil }))
     app = @app
-    app.workers.spawn(name: "plugboard.async") do
+    app.job do
       begin
         value = work.call(token)
         app.enqueue(-> {

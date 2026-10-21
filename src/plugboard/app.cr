@@ -3,6 +3,7 @@ class Plugboard::App
   getter output     : IO
   getter bus        : Bus
   getter timers     : Timers
+  getter clock      : Clock
   property retained : Int32
 
   getter? async_output : Bool
@@ -13,11 +14,12 @@ class Plugboard::App
   @outbox  : Channel(Bytewire)?
   @writer  : Fiber::ExecutionContext::Isolated?
   @failure : Exception?
+  @wake    : Proc(Nil)
 
   def initialize(@output : IO, *, workers : Fiber::ExecutionContext? = nil, retained : Int32 = 1 << 20,
-                 @async_output : Bool = false)
+                 @async_output : Bool = false, @clock : Clock = Clock::SYSTEM)
     @bus       = Bus.new
-    @timers    = Timers.new
+    @timers    = Timers.new(@clock)
     @workers   = workers
     @local     = Deque(Event | Action).new
     @shared    = Deque(Event | Action).new
@@ -41,6 +43,8 @@ class Plugboard::App
     @idle      = Sync::ConditionVariable.new(@lock)
     @writing   = false
     @failure   = nil
+    @jobs      = Atomic(Int32).new(0)
+    @wake      = -> { ring; nil }
   end
 
   def running? : Bool
@@ -135,11 +139,28 @@ class Plugboard::App
   end
 
   def async(&block : -> Message) : Nil
-    workers.spawn(name: "plugboard.async") do
-      post(block.call)
-    rescue ex
-      post(AsyncError.new(ex))
+    job do
+      begin
+        post(block.call)
+      rescue ex
+        post(AsyncError.new(ex))
+      end
     end
+  end
+
+  def job(&work : -> Nil) : Nil
+    @jobs.add(1)
+    workers.spawn(name: "plugboard.async") do
+      begin
+        work.call
+      ensure
+        ring if @jobs.sub(1) == 1
+      end
+    end
+  end
+
+  def jobs : Int32
+    @jobs.get
   end
 
   def async(work : Proc(T), &done : T -> Nil) : Disposable forall T
@@ -210,6 +231,7 @@ class Plugboard::App
     @owner = Fiber.current
     @running.set(true)
     failure = nil.as(Exception?)
+    @clock.watch(@wake)
     begin
       start_sessions
       flush
@@ -286,6 +308,7 @@ class Plugboard::App
   end
 
   private def shutdown(failure : Exception?) : Exception?
+    @clock.unwatch(@wake)
     @sessions.dup.reverse_each do |session|
       begin
         session.stop
@@ -316,11 +339,11 @@ class Plugboard::App
 
   private def await : Nil
     return unless @local.empty?
-    if span = @timers.delay(Time.instant)
+    if span = @timers.delay(@clock.now)
       if span > Time::Span.zero
         select
         when @bell.receive
-        when timeout(span)
+        when timeout(@clock.budget(span))
         end
       end
     else
@@ -330,7 +353,7 @@ class Plugboard::App
   end
 
   private def drain : Nil
-    @timers.each_due(Time.instant) { |timer| guard { timer.fire } }
+    @timers.each_due(@clock.now) { |timer| guard { timer.fire } }
     until @stopping.get
       if item = @local.shift?
         guard { route(item) }
