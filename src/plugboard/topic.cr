@@ -3,9 +3,9 @@ require "./chain"
 
 class Plugboard::Topic(T)
   def initialize
-    @chain = Chain(T).new
+    @chain     = Chain(T).new
     @listeners = [] of T -> Nil
-    @handlers = [] of T -> Bool
+    @handlers  = [] of T -> Bool
     @chain.sink = ->(event : T) { deliver(event) }
   end
 

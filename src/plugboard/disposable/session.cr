@@ -5,7 +5,7 @@ class Plugboard::Session
   @undo : (-> Nil)?
 
   def initialize(@owner : Context, @setup : -> (-> Nil))
-    @undo = nil
+    @undo     = nil
     @disposed = false
   end
 
@@ -15,7 +15,7 @@ class Plugboard::Session
   end
 
   def stop : Nil
-    undo = @undo || return
+    undo  = @undo || return
     @undo = nil
     undo.call
   end

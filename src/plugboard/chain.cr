@@ -5,7 +5,7 @@ class Plugboard::Chain(T)
   def initialize
     @links = [] of Proc(T, Proc(T, Nil), Nil)
     @nexts = [] of Proc(T, Nil)
-    @sink = ->(event : T) { false }
+    @sink  = ->(event : T) { false }
     @result = false
   end
 
@@ -25,7 +25,7 @@ class Plugboard::Chain(T)
   end
 
   def run(event : T) : Bool
-    held = @result
+    held    = @result
     @result = false
     begin
       step(@links, @nexts, 0, event)
