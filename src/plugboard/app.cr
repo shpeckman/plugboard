@@ -207,7 +207,7 @@ class Plugboard::App
         wake     = true
       end
     end
-    @bell.send(nil) if wake
+    toll if wake
   end
 
   private def ring : Nil
@@ -218,7 +218,14 @@ class Plugboard::App
         wake     = true
       end
     end
-    @bell.send(nil) if wake
+    toll if wake
+  end
+
+  private def toll : Nil
+    select
+    when @bell.send(nil)
+    else
+    end
   end
 
   private def absorb : Nil
