@@ -32,6 +32,13 @@ module Plugboard
   struct StoppedEvent
   end
 
+  struct FlushEvent
+    getter? final : Bool
+
+    def initialize(@final : Bool = false)
+    end
+  end
+
   abstract class Message
   end
 
@@ -62,5 +69,5 @@ module Plugboard
     end
   end
 
-  events IdleEvent, RenderEvent, StoppedEvent, MessageEvent, ErrorEvent
+  events IdleEvent, RenderEvent, FlushEvent, StoppedEvent, MessageEvent, ErrorEvent
 end
