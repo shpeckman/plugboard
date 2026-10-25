@@ -1,8 +1,6 @@
 # src/plugboard.cr
-require "bytewire"
 require "sync"
 require "sync/mutex"
-require "sync/condition_variable"
 require "./plugboard/fault"
 require "./plugboard/event"
 require "./plugboard/disposable"

@@ -11,10 +11,6 @@ module Plugboard
     def setup : Nil
     end
 
-    def buffer : Bytewire
-      @ctx.buffer
-    end
-
     def dispose : Nil
       @ctx.dispose
     end

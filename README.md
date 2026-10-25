@@ -5,8 +5,9 @@ timers, and scopes that undo everything registered through them. Features are
 written as plugins that wire themselves into the bus and are removed cleanly
 when disposed.
 
-It is built for programs that react to events and write to a byte stream, such
-as terminal applications.
+It is built for programs that react to events, such as terminal applications.
+The kernel writes nothing itself: each pass ends with a `FlushEvent`, the point
+at which a program sends out whatever it collected.
 
 ```crystal
 require "plugboard"
@@ -20,8 +21,8 @@ end
 
 Plugboard.events Greeting
 
-app = Plugboard::App.new(STDOUT)
-app.on(Greeting) { |event| app.buffer.str("hello ").str(event.name).char('\n') }
+app = Plugboard::App.new
+app.on(Greeting) { |event| puts "hello #{event.name}" }
 app.post(Greeting.new("world"))
 app.after(1.second) { app.stop }
 app.run
@@ -38,7 +39,7 @@ app.run
 - [Sessions](#sessions)
 - [Timers](#timers)
 - [The run loop](#the-run-loop)
-- [Output](#output)
+- [Flushing](#flushing)
 - [Background work](#background-work)
 - [Errors](#errors)
 - [Fibers and parallelism](#fibers-and-parallelism)
@@ -56,11 +57,7 @@ dependencies:
     github: shpeckman/plugboard
 ```
 
-Crystal 1.21 or newer is required. The shard depends on
-[bytewire](https://github.com/shpeckman/bytewire), which provides the output
-buffer and the appenders used in the examples. Because the buffer is a plain
-`Bytewire`, it can be handed directly to other shards that write into one, such
-as [term](https://github.com/shpeckman/term).
+Crystal 1.21 or newer is required. The shard has no dependencies.
 
 ## Events
 
@@ -125,7 +122,7 @@ Each event type has three kinds of hook. All of them return a disposable; call
 `dispose` on it to remove the hook.
 
 ```crystal
-app.on(Resized) { |event| app.buffer.int(event.cols).char('x').int(event.rows).char('\n') }
+app.on(Resized) { |event| puts "#{event.cols}x#{event.rows}" }
 
 app.handle(Resized) { |event| event.cols < 20 }
 
@@ -162,11 +159,11 @@ same methods to its root scope.
 
 ```crystal
 scope = app.nest
-scope.on(Tick) { app.buffer.str("tick\n") }
+scope.on(Tick) { puts "tick" }
 scope.every(1.second) { app.emit(Tick.new) }
 scope.effect do
-  app.buffer.str("opened\n")
-  -> { app.buffer.str("closed\n"); nil }
+  puts "opened"
+  -> { puts "closed"; nil }
 end
 scope.dispose
 ```
@@ -202,7 +199,7 @@ class Reading
 end
 
 sensor = Reading.new
-scope.on(sensor.topic) { |value| app.buffer.str("now ").str(value.to_s).char('\n') }
+scope.on(sensor.topic) { |value| puts "now #{value}" }
 scope.dispose
 ```
 
@@ -269,8 +266,8 @@ outlive the run, such as terminal modes.
 
 ```crystal
 app.session do
-  app.buffer.csi.str("?1049h")
-  -> { app.buffer.csi.str("?1049l"); nil }
+  print "\e[?1049h"
+  -> { print "\e[?1049l"; nil }
 end
 ```
 
@@ -282,7 +279,7 @@ raises.
 ## Timers
 
 ```crystal
-once  = app.after(500.milliseconds) { app.buffer.str("late\n") }
+once  = app.after(500.milliseconds) { puts "late" }
 pulse = app.every(100.milliseconds) { app.emit(Tick.new) }
 once.cancel
 pulse.cancel
@@ -300,7 +297,7 @@ period, the missed ticks are skipped.
 A timer belongs to the scope that created it and is cancelled with that scope.
 
 Timers and the loop read time from the app's clock, a `Plugboard::Clock` passed
-as `App.new(output, clock: …)`; `Plugboard::Clock::SYSTEM` is the default. A
+as `App.new(clock: …)`; `Plugboard::Clock::SYSTEM` is the default. A
 clock answers `now`, says how long the loop may sleep for a deadline
 (`budget`), and calls the procs registered with `watch` when it jumps, so a
 test clock can stand still and wake the loop when it is moved. `ctx.now`
@@ -316,7 +313,7 @@ returns the clock's current instant.
    along the way.
 4. Emits `Plugboard::IdleEvent`.
 5. Emits `Plugboard::RenderEvent`, only if the app is dirty.
-6. Flushes the output buffer.
+6. Emits `Plugboard::FlushEvent`.
 
 The app becomes dirty when a non-reply event is emitted or when
 `app.invalidate` is called. Many events in one pass therefore produce one
@@ -328,64 +325,43 @@ and returns, which means events still queued when `stop` is called are
 abandoned rather than delivered. Anything that must happen on the way out
 belongs in a session's undo step or a `StoppedEvent` listener.
 
-On the way out the loop stops the sessions, emits `Plugboard::StoppedEvent` and
-flushes once more. `run` can be called again afterwards.
+The loop also emits a `FlushEvent` once the sessions have started, before the
+first pass. On the way out it stops the sessions, emits `Plugboard::StoppedEvent`
+and then a final `FlushEvent`, whose `final?` is true. `run` can be called again afterwards.
 
 The queue is unbounded, so posting never blocks the producer, including before
 `run` has started. `app.pending` reports how much is waiting.
 
-## Output
+## Flushing
 
-`app.buffer` is a `Bytewire` that collects output until the loop flushes it
-to the output IO. Writing to it never blocks and never interleaves with another
-writer.
-
-```crystal
-app.buffer.csi.str("2J").csi.char('H')
-app.flush
-```
-
-Every appender returns the builder, so writes chain. See the
-[bytewire README](https://github.com/shpeckman/bytewire#appenders) for the full
-set of appenders and templates.
-
-`app.flush` writes immediately. `app.scratch` returns a second builder, reset
-on each call, for assembling a value before it is written. Plugins have
-`buffer` as a shortcut for `ctx.buffer`.
-
-A write that fails is fatal: the buffer is cleared so it cannot grow without
-bound, and the error unwinds the loop. `app.retained` is the capacity, 1 MiB by
-default, above which either builder is shrunk after a flush.
-
-### Asynchronous output
-
-By default `flush` writes on the loop's fiber, so a slow output — a terminal
-over SSH, a full pipe — holds the loop until the bytes are gone. Pass
-`async_output: true` and the loop never waits on the output again:
+plugboard keeps no output of its own. A program collects what it writes during
+a pass — into a buffer, a builder, a list of draw commands — and sends it out
+when the loop says the pass is over:
 
 ```crystal
-app = Plugboard::App.new(STDOUT, async_output: true)
+pending = [] of String
+app.on(Tick) { pending << "tick" }
+app.on(Plugboard::FlushEvent) do |flush|
+  pending.each { |line| puts line }
+  pending.clear
+  STDOUT.flush if flush.final?
+end
 ```
 
-The app then keeps two buffers. `flush` swaps them and hands the full one to a
-writer that owns its own thread (a `Fiber::ExecutionContext::Isolated` named
-`plugboard.writer`), so nothing is copied and the loop goes straight back to
-delivering events. While that write is in flight:
+`FlushEvent` comes after `RenderEvent`, so a frame rendered on this pass is
+complete when it arrives. The last one, emitted after `StoppedEvent`, has
+`final?` set: anything written on the way out — by a session's undo or a
+`StoppedEvent` listener — is collected by then, and a listener that writes on
+another thread should wait for that write to finish before returning.
 
-- further output keeps collecting in `app.buffer` and leaves with the next
-  hand-off, so a slow output coalesces many passes into one write;
-- the loop defers `RenderEvent` and keeps the app dirty, so it never renders
-  frames the output cannot take yet. When the writer finishes it wakes the loop,
-  which renders the latest state once.
+An exception raised by a `FlushEvent` listener is not reported as an
+`ErrorEvent`: it unwinds the loop, since output that cannot be written leaves
+nothing to recover.
 
-`app.writing?` reports whether a hand-off is in flight. `app.flush(wait: true)`
-blocks until everything collected so far has been written; the loop uses it on
-the way out, so nothing written before `stop` is lost. A failed write is still
-fatal: it is raised on the loop at the next flush.
-
-`app.buffer` returns the buffer currently collecting output. Ask for it each
-time you write rather than keeping it in a variable, since the two buffers
-trade places on every hand-off.
+To pace rendering to a slow output, intercept `RenderEvent` while a write is in
+flight, call `invalidate` instead of passing the event on, and wake the loop
+with `enqueue` when the write finishes. The app stays dirty, so it renders the
+latest state once the output can take it.
 
 ## Background work
 
@@ -406,9 +382,9 @@ app.async { Loaded.new(File.read_lines("/etc/hosts").size) }
 app.on(Plugboard::MessageEvent) do |event|
   case message = event.message
   when Loaded
-    app.buffer.int(message.lines).str(" lines\n")
+    puts "#{message.lines} lines"
   when Plugboard::AsyncError
-    app.buffer.str("failed: ").str(message.error.message || "unknown").char('\n')
+    puts "failed: #{message.error.message || "unknown"}"
   end
 end
 ```
@@ -425,7 +401,7 @@ other workers. Pass a context of your own to size it differently, or to share
 one between several apps:
 
 ```crystal
-app = Plugboard::App.new(STDOUT, workers: Fiber::ExecutionContext::Parallel.new("workers", 4))
+app = Plugboard::App.new(workers: Fiber::ExecutionContext::Parallel.new("workers", 4))
 ```
 
 Because workers run in parallel with each other, anything two blocks share must
@@ -450,7 +426,7 @@ There is no message type to declare and no central listener to extend:
 
 ```crystal
 lease = ctx.async(->{ File.read_lines("/etc/hosts").size }) do |lines|
-  ctx.buffer.int(lines).str(" lines\n")
+  puts "#{lines} lines"
 end
 ```
 
@@ -482,7 +458,7 @@ lease = ctx.async(->(token : Plugboard::Token) {
     total += File.size(file)
   end
   total
-}) { |total| ctx.buffer.int(total).char('\n') }
+}) { |total| puts total }
 ```
 
 `token.cancelled?` is an atomic read, cheap enough to check inside a loop.
@@ -516,10 +492,9 @@ fails too.
 ## Fibers and parallelism
 
 The kernel is owned by the fiber that calls `run`. It keeps the bus, the timer
-heap, the scopes and the output buffer in plain arrays and deques, with no
-locks, because only that one fiber touches them.
+heap and the scopes in plain arrays and deques, with no locks, because only that one fiber touches them.
 
-Five methods are safe to call from any fiber, in any execution context:
+These methods are safe to call from any fiber, in any execution context:
 
 | Call               | What makes it safe                                  |
 |--------------------|-----------------------------------------------------|
@@ -527,13 +502,11 @@ Five methods are safe to call from any fiber, in any execution context:
 | `app.enqueue`      | Same queue; runs a proc on the loop                 |
 | `app.stop`         | An atomic flag, then a wake-up                      |
 | `app.async { }`    | Spawns into the worker context and posts the result |
-| `app.writing?`     | Reads the writer's state under its lock             |
 | `timer.cancel`     | An atomic flag; the heap edit is deferred to the loop |
 
 Everything else must be called from the loop's fiber: `emit`, `on`, `handle`,
 `intercept`, `after`, `every`, `plugin`, `nest`, `effect`, `session`, `own`,
-`disown`, `dispose`, `report`, `pending`, `async(work, &done)` and the buffer
-accessors. In practice
+`disown`, `dispose`, `report`, `pending` and `async(work, &done)`. In practice
 that means from inside a listener, handler, timer, session or plugin. Build
 with `-Dplugboard_assert` and each of them raises when called from anywhere
 else. The checks are off otherwise, in debug and release builds alike; turn
@@ -550,10 +523,6 @@ the cheap way to find out before it matters.
 The worker context is separate from the loop's, so `async` blocks run in
 parallel with the loop, and with each other, by design. They communicate with
 the loop only through `post`, so nothing of the kernel's needs a lock.
-
-With `async_output: true` the output IO is written from the writer's thread,
-never from the loop's. Only one write is in flight at a time, and the loop
-never touches the buffer being written.
 
 Events posted from the loop's own fiber skip the mutex and go straight to a
 local deque. Both queues are unbounded: a producer is never blocked, and
@@ -579,21 +548,18 @@ Adds `App#name`, `App#name?` and `Context#name`.
 
 ### App
 
-The application: owns the bus, the timers, the queue, the output buffer and the
-root scope.
+The application: owns the bus, the timers, the queue and the root scope.
 
 **Construction and lifecycle**
 
-`App.new(output : IO, *, workers : Fiber::ExecutionContext? = nil, retained : Int32 = 1 << 20, async_output : Bool = false, clock : Clock = Clock::SYSTEM) : App`  
+`App.new(*, workers : Fiber::ExecutionContext? = nil, clock : Clock = Clock::SYSTEM) : App`  
 Creates an app.  
-Nothing is written until `run`.  
 `workers` is where `async` blocks run; the default is a `Fiber::ExecutionContext::Parallel` named `plugboard.workers`, sized to `default_workers_count` and built on first use.  
-`async_output` moves writes to a dedicated writer thread and paces rendering to the output; see [Asynchronous output](#asynchronous-output).  
 `clock` is where timers and the loop read the time; see [Timers](#timers).  
 
 `#run : Nil`  
 Starts the sessions and runs the loop until stopped.  
-Stops the sessions, emits `StoppedEvent` and flushes on the way out, then raises the first error if there was one.  
+Stops the sessions, emits `StoppedEvent` and a final `FlushEvent` on the way out, then raises the first error if there was one.  
 May be called again afterwards.  
 
 `#stop : Nil`  
@@ -611,9 +577,6 @@ True before `run` has started, since there is no loop to contend with.
 `#assert_loop : Nil`  
 Raises unless `on_loop?`.  
 Compiled out unless the program is built with `-Dplugboard_assert`.  
-
-`#output : IO`  
-The output given to `new`.  
 
 `#workers : Fiber::ExecutionContext`  
 The context `async` blocks run in.  
@@ -710,38 +673,13 @@ Calls the block once, `span` from now.
 `#every(span : Time::Span, &block : -> Nil) : Timer`  
 Calls the block every `span`, first after one `span`.  
 
-**Output and rendering**
-
-`#buffer : Bytewire`  
-The pending output.  
-Flushed by the loop once per pass.  
-
-`#scratch : Bytewire`  
-A shared work buffer, reset on every call.  
-
-`#flush(wait : Bool = false) : Nil`  
-Writes the pending output now, or with `async_output` hands it to the writer.  
-Clears the buffer even when the write fails, then lets the error through.  
-With `wait: true`, returns only once everything collected so far has been written.  
-Also shrinks either builder if it has grown past `retained`.  
-
-`#writing? : Bool`  
-Whether an asynchronous write is in flight.  
-Always false without `async_output`.  
-Safe from any fiber.  
-
-`#async_output? : Bool`  
-Whether the app was built with `async_output`.  
+**Rendering**
 
 `#invalidate : Nil`  
 Requests a `RenderEvent` on this pass.  
 
 `#dirty? : Bool`  
 Whether a `RenderEvent` is pending.  
-With `async_output`, stays true while rendering is deferred behind a write.  
-
-`#retained : Int32` / `#retained=`  
-Capacity, 1 MiB by default, above which a builder is shrunk after a flush.  
 
 **Errors**
 
@@ -806,7 +744,7 @@ Same as `App#emit`.
 Same as `App#post`, for an event or a message.  
 Safe from any fiber.  
 
-`#buffer`, `#scratch`, `#flush`, `#invalidate`  
+`#invalidate`  
 Same as on `App`.  
 
 `#own(item : T) : T`  
@@ -845,9 +783,6 @@ Does nothing by default.
 
 `#ctx : Context`  
 The plugin's own scope.  
-
-`#buffer : Bytewire`  
-Shortcut for `ctx.buffer`.  
 
 `#dispose : Nil`  
 Disposes the plugin's scope.  
@@ -932,6 +867,10 @@ Emitted once per pass, after the queue is empty and before rendering.
 `RenderEvent` (struct)  
 Emitted once per pass if the app is dirty.  
 
+`FlushEvent` (struct)  
+Emitted at the end of every pass, once after the sessions start, and once more after `StoppedEvent`.  
+`#final? : Bool` is true only for that last one.  
+
 `StoppedEvent` (struct)  
 Emitted once when `run` ends, after the sessions have stopped.  
 
@@ -958,7 +897,7 @@ An `Exception` raised when a second failure follows the one being handled.
 The registered types, readable in macros as `::Plugboard::EVENT_TYPES`.  
 Complete only once the whole program has been read, so use it inside a method body or `macro finished`.  
 
-The loop sends `IdleEvent`, `RenderEvent`, `StoppedEvent` and `ErrorEvent`
+The loop sends `IdleEvent`, `RenderEvent`, `FlushEvent`, `StoppedEvent` and `ErrorEvent`
 straight to their topics. Typed interceptors, listeners and handlers see them;
 the untyped `intercept` does not.
 
@@ -1025,11 +964,7 @@ methods may change without notice.
 
 - Events must be registered at compile time. A type that was never passed to
   `Plugboard.events` cannot be emitted.
-- `app.scratch` is a single shared builder. A slice taken from it is valid only
-  until the next call to `scratch`.
 - Handlers have no priority. They run in registration order.
-- With `async_output`, `app.buffer` changes identity on every hand-off; never
-  keep it in a variable across passes.
 - The queue is unbounded by design, so a producer that outruns the loop grows
   it rather than being held back. Watch `app.pending` if that matters.
 - `app.stop` abandons whatever is still queued.

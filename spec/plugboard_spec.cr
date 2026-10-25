@@ -70,20 +70,10 @@ class Breaker < Plugboard::Plugin
   end
 end
 
-class Sealed < IO
-  def read(slice : Bytes) : Int32
-    raise IO::Error.new("read is not supported")
-  end
-
-  def write(slice : Bytes) : Nil
-    raise IO::Error.new("write is not supported")
-  end
-end
-
 Plugboard.service journal : Journal
 
 private def bare : Plugboard::App
-  Plugboard::App.new(IO::Memory.new)
+  Plugboard::App.new
 end
 
 private def boom : Plugboard::Message
@@ -381,26 +371,19 @@ describe Plugboard::App do
     lines.should eq ["on", "added", "off", "disposed"]
   end
 
-  it "flushes the output buffer once per loop iteration and on demand" do
-    output = IO::Memory.new
-    app = Plugboard::App.new(output)
-    app.on(Note) { |note| app.buffer.str("n").int(note.value).char(';') }
+  it "ends every pass with a flush and the loop with a final one" do
+    app = bare
+    trail = [] of String
+    app.on(Note) { |note| trail << "n#{note.value}" }
+    app.on(Plugboard::RenderEvent) { trail << "render" }
+    app.on(Plugboard::StoppedEvent) { trail << "stopped" }
+    app.on(Plugboard::FlushEvent) { |flush| trail << (flush.final? ? "final" : "flush") }
     app.post(Note.new(1))
     app.post(Note.new(2))
     cycle(app)
-    output.to_s.should eq "n1;n2;"
-    app.buffer.empty?.should be_true
-    app.buffer.str("late")
-    output.to_s.should eq "n1;n2;"
-    app.flush
-    output.to_s.should eq "n1;n2;late"
-  end
-
-  it "clears the buffer even when the output rejects the write" do
-    app = Plugboard::App.new(Sealed.new)
-    app.buffer.str("lost")
-    expect_raises(IO::Error) { app.flush }
-    app.buffer.empty?.should be_true
+    trail.first(5).should eq ["flush", "n1", "n2", "render", "flush"]
+    trail.last(2).should eq ["stopped", "final"]
+    trail.count("final").should eq 1
   end
 
   it "installs services on first use and clears them on disposal" do
@@ -655,37 +638,15 @@ describe Plugboard::App do
   end
 
   it "builds no worker context until async needs one" do
-    apps = Array.new(512) { Plugboard::App.new(IO::Memory.new) }
+    apps = Array.new(512) { Plugboard::App.new }
     apps.size.should eq 512
     apps.last.pending.should eq 0
   end
 
-  it "takes a worker context and a buffer threshold from the caller" do
+  it "takes a worker context from the caller" do
     workers = Fiber::ExecutionContext::Concurrent.new("spec.workers")
-    app = Plugboard::App.new(IO::Memory.new, workers: workers, retained: 4096)
+    app = Plugboard::App.new(workers: workers)
     app.workers.should be(workers)
-    app.retained.should eq 4096
-    app.retained = 8192
-    app.retained.should eq 8192
-  end
-
-  it "writes through a dedicated writer when async output is on" do
-    output = IO::Memory.new
-    app = Plugboard::App.new(output, async_output: true)
-    app.async_output?.should be_true
-    app.buffer.str("frame")
-    app.flush(wait: true)
-    output.to_s.should eq "frame"
-    app.writing?.should be_false
-  end
-
-  it "keeps output written before the loop stops" do
-    output = IO::Memory.new
-    app = Plugboard::App.new(output, async_output: true)
-    app.on(Note) { |note| app.buffer.int(note.value) }
-    app.post(Note.new(7))
-    cycle(app)
-    output.to_s.should eq "7"
   end
 
   it "cancels the token of a disposed async lease" do

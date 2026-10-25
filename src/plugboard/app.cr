@@ -1,23 +1,15 @@
 # src/plugboard/app.cr
 class Plugboard::App
-  getter output     : IO
-  getter bus        : Bus
-  getter timers     : Timers
-  getter clock      : Clock
-  property retained : Int32
-
-  getter? async_output : Bool
+  getter bus    : Bus
+  getter timers : Timers
+  getter clock  : Clock
 
   @root    : Context?
   @owner   : Fiber?
   @workers : Fiber::ExecutionContext?
-  @outbox  : Channel(Bytewire)?
-  @writer  : Fiber::ExecutionContext::Isolated?
-  @failure : Exception?
   @wake    : Proc(Nil)
 
-  def initialize(@output : IO, *, workers : Fiber::ExecutionContext? = nil, retained : Int32 = 1 << 20,
-                 @async_output : Bool = false, @clock : Clock = Clock::SYSTEM)
+  def initialize(*, workers : Fiber::ExecutionContext? = nil, @clock : Clock = Clock::SYSTEM)
     @bus       = Bus.new
     @timers    = Timers.new(@clock)
     @workers   = workers
@@ -31,18 +23,8 @@ class Plugboard::App
     @stopping  = Atomic(Bool).new(false)
     @dirty     = false
     @reporting = false
-    @buffer    = Bytewire.new
-    @scratch   = Bytewire.new(256)
-    @retained  = retained
     @root      = nil
     @owner     = nil
-    @spare     = Bytewire.new
-    @outbox    = nil
-    @writer    = nil
-    @lock      = Sync::Mutex.new
-    @idle      = Sync::ConditionVariable.new(@lock)
-    @writing   = false
-    @failure   = nil
     @jobs      = Atomic(Int32).new(0)
     @wake      = -> { ring; nil }
   end
@@ -192,33 +174,6 @@ class Plugboard::App
     raise error unless event.handled?
   end
 
-  def buffer : Bytewire
-    assert_loop
-    @buffer
-  end
-
-  def scratch : Bytewire
-    assert_loop
-    @scratch.reset
-    @scratch
-  end
-
-  def flush(wait : Bool = false) : Nil
-    assert_loop
-    if @async_output
-      hand_off
-      settle if wait
-    else
-      write_now
-    end
-    @buffer.shrink(@retained) if @buffer.empty? && @buffer.capacity > @retained
-    @scratch.shrink(@retained) if @scratch.capacity > @retained
-  end
-
-  def writing? : Bool
-    @async_output && @lock.synchronize { @writing }
-  end
-
   def invalidate : Nil
     @dirty = true
   end
@@ -323,12 +278,7 @@ class Plugboard::App
       failure ||= error
     end
     begin
-      flush(wait: true)
-    rescue error
-      failure ||= error
-    end
-    begin
-      stop_writer
+      flush(final: true)
     rescue error
       failure ||= error
     end
@@ -376,7 +326,6 @@ class Plugboard::App
 
   private def render : Nil
     return unless @dirty
-    return if writing?
     @dirty = false
     guard { @bus.topic(RenderEvent).emit(RenderEvent.new) }
   end
@@ -387,86 +336,7 @@ class Plugboard::App
     report(error)
   end
 
-  private def write_now : Nil
-    return if @buffer.empty?
-    begin
-      @output.write(@buffer.written)
-      @output.flush
-    ensure
-      @buffer.reset
-    end
-  end
-
-  private def hand_off : Nil
-    busy, failure = @lock.synchronize do
-      found    = @failure
-      @failure = nil
-      {@writing, found}
-    end
-    if failure
-      @buffer.reset
-      raise failure
-    end
-    return if busy || @buffer.empty?
-    outbox  = writer
-    full    = @buffer
-    @buffer = @spare
-    @spare  = full
-    @lock.synchronize { @writing = true }
-    outbox.send(full)
-  end
-
-  private def settle : Nil
-    loop do
-      @lock.synchronize do
-        while @writing
-          @idle.wait
-        end
-      end
-      break if @buffer.empty?
-      hand_off
-    end
-    failure = @lock.synchronize do
-      found    = @failure
-      @failure = nil
-      found
-    end
-    raise failure if failure
-  end
-
-  private def writer : Channel(Bytewire)
-    @outbox ||= begin
-      outbox  = Channel(Bytewire).new(1)
-      @writer = Fiber::ExecutionContext::Isolated.new("plugboard.writer") { pour(outbox) }
-      outbox
-    end
-  end
-
-  private def pour(outbox : Channel(Bytewire)) : Nil
-    while full = outbox.receive?
-      failure = nil.as(Exception?)
-      begin
-        @output.write(full.written)
-        @output.flush
-      rescue error
-        failure = error
-      end
-      full.reset
-      full.shrink(@retained) if full.capacity > @retained
-      @lock.synchronize do
-        @writing = false
-        @failure ||= failure
-        @idle.broadcast
-      end
-      ring
-    end
-  end
-
-  private def stop_writer : Nil
-    outbox = @outbox || return
-    outbox.close
-    @writer.try(&.wait)
-    @outbox = nil
-    @writer = nil
+  private def flush(final : Bool = false) : Nil
+    @bus.topic(FlushEvent).emit(FlushEvent.new(final))
   end
 end

@@ -7,22 +7,22 @@ Orientation for AI agents working on plugboard.
 plugboard is a small application kernel for Crystal: a typed event bus, a
 single-fiber event loop with a timer heap, and ownership scopes that undo
 everything registered through them. Features are plugins that wire themselves
-into the bus. Output is collected in a [`Bytewire`](https://github.com/shpeckman/bytewire)
-buffer and flushed once per loop pass, so it can be handed directly to shards
-that render into a `Bytewire`, such as [term](https://github.com/shpeckman/term).
+into the bus. The kernel owns no output: every pass ends with a `FlushEvent`,
+and programs write what they collected from its listener. The shard has no
+dependencies.
 
 ## Repository layout
 
 ```
-shard.yml                         dependencies (bytewire)
-src/plugboard.cr                  entry point; requires bytewire, sync and every module
+shard.yml                         shard metadata; no dependencies
+src/plugboard.cr                  entry point; requires sync and every module
 src/plugboard/fault.cr            Fault: an error raised when a second failure follows the first
 src/plugboard/event.cr            Plugboard.events macro, Event union, built-in events, Message, Quiet, Action
 src/plugboard/bus.cr              Bus: one Topic per registered type, untyped gate chain, deliver
 src/plugboard/topic.cr            Topic(T): interceptor chain, listeners, handlers
 src/plugboard/chain.cr            Chain(T): middleware pipeline with prebuilt next-procs
 src/plugboard/context.cr          Context: ownership scope, registration methods, typed async, own/disown/dispose
-src/plugboard/app.cr              App: run loop, queues, buffers, flush, sessions, error reporting
+src/plugboard/app.cr              App: run loop, queues, sessions, flush events, error reporting
 src/plugboard/timer.cr            Timer and Timers (indexed binary min-heap)
 src/plugboard/disposable.cr       Disposable module and its slot
 src/plugboard/token.cr            Token: atomic cancellation flag handed to async work
@@ -52,20 +52,20 @@ dedicated on purpose: Crystal sets `flag?(:debug)` in every build that carries
 debug info, which is the default even with `--release`, so gating on it would
 leave the checks on everywhere.
 
-## Working with the buffer
+## Flushing
 
-`App#buffer`, `App#scratch`, `Context#buffer`, `Context#scratch` and
-`Plugin#buffer` return `Bytewire` directly; there is no plugboard-specific
-alias. Write with chained appenders (`buf.csi.int(row).semi.int(col).char('H')`,
-`buf.str(...)`, `buf.int(...)`). There is no `bbwrite` macro.
-
-A failed write is fatal: `flush` clears the buffer in an `ensure` so it cannot
-grow without bound, then lets the error unwind the loop.
+`App#run` emits `FlushEvent` straight to its topic after `start_sessions`, at
+the end of every pass (after `render`), and once more with `final: true` after
+`StoppedEvent` in `shutdown`. It is not guarded: an exception from a listener
+unwinds the loop, because a failed write is fatal. Rendering is never deferred
+by the kernel; a program that paces frames to its output intercepts
+`RenderEvent`, calls `invalidate` and wakes the loop with `enqueue` when its
+write lands.
 
 ## Concurrency and ownership
 
-The loop fiber owns the bus, the timer heap, the scopes and both builders, all
-of them plain arrays and deques with no locks. The README's
+The loop fiber owns the bus, the timer heap and the scopes, all of them plain
+arrays and deques with no locks. The README's
 **Fibers and parallelism** section is the public contract; these are the
 invariants behind it.
 
@@ -137,23 +137,6 @@ fiber. A failure is re-raised inside the enqueued reply rather than passed to
 the `Proc(T)` form wraps it. The lease's undo step flips `live` (loop-only, a
 plain `Bool`) and cancels the `Token` (an `Atomic(Bool)`, because the worker
 reads it from another thread).
-
-**Asynchronous output.** With `async_output: true`, `flush` calls `hand_off`:
-under `@lock` it takes any stored write failure and reads `@writing`; if no
-write is in flight and the buffer has bytes it swaps `@buffer` and `@spare`,
-sets `@writing` and sends the full builder over `@outbox` (capacity one, so the
-send never blocks: there is at most one builder in flight). The writer is a
-`Fiber::ExecutionContext::Isolated` built on first hand-off, because it makes
-blocking writes and must own its thread. After each write it resets and shrinks
-the builder, clears `@writing`, records the first failure, broadcasts `@idle`
-and rings the bell so the loop renders what it deferred. `render` returns early
-while `writing?`, leaving `@dirty` set — that is the frame pacing; do not move
-the check after `@dirty = false`. `settle` (`flush(wait: true)`) waits on
-`@idle`, hands off what remains and repeats until the buffer is empty.
-`shutdown` settles, then `stop_writer` closes `@outbox` and waits for the
-writer, so `run` may be called again and builds a fresh writer. The loop never
-touches the builder in flight: after a swap it lives in `@spare`, which the loop
-only takes back in the next `hand_off`, after `@writing` is false.
 
 **Known costs.** `App#detach` is an `Array#delete`, O(n) in the session
 count, which is always small; leave it.

@@ -144,18 +144,6 @@ class Plugboard::Context
     lease
   end
 
-  def buffer : Bytewire
-    @app.buffer
-  end
-
-  def scratch : Bytewire
-    @app.scratch
-  end
-
-  def flush(wait : Bool = false) : Nil
-    @app.flush(wait)
-  end
-
   def invalidate : Nil
     @app.invalidate
   end
