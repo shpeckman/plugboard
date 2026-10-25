@@ -107,8 +107,12 @@ unbounded, so nothing blocks a producer.
 
 **The doorbell.** `@bell` is a `Channel(Nil)` of capacity one, and `@ringing`
 tracks whether a ring is in flight. A producer sets `@ringing` inside the same
-critical section as its push and only sends when it was the one to set it, so
-the send can never block on a full channel. The loop clears `@ringing` **before**
+critical section as its push and only sends when it was the one to set it.
+`absorb` clears `@ringing` without taking the token, so a token can still sit in
+the channel when the next ring fires; `toll` therefore sends without blocking
+and drops the ring when the channel is full, since the waiting token already
+wakes the loop. A blocking send there deadlocks a loop that rings itself
+(`release_renders`, `wake`). The loop clears `@ringing` **before**
 draining, never after: that ordering is what makes a lost wake-up impossible.
 A spurious wake-up — the loop drains an item whose ring is still in flight — is
 harmless and expected. Do not reorder those two steps.

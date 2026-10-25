@@ -751,6 +751,25 @@ describe Plugboard::App do
     app.renders_held?.should be_false
   end
 
+  it "renders when a hold is released by an action posted from another fiber" do
+    app = bare
+    renders = 0
+    app.on(Plugboard::RenderEvent) { renders += 1 }
+    app.after(5.milliseconds) do
+      hold = app.hold_render
+      app.invalidate
+      posted = Channel(Nil).new
+      spawn do
+        app.enqueue(-> { hold.dispose; nil })
+        posted.send(nil)
+      end
+      posted.receive
+    end
+    cycle(app, 60.milliseconds)
+    renders.should eq 1
+    app.running?.should be_false
+  end
+
   it "disposes its root scope and starts over with a fresh one" do
     app = bare
     seen = [] of Int32
