@@ -14,13 +14,6 @@ end
 
 Plugboard.events Note, Answer
 
-class Loaded < Plugboard::Message
-  getter value : Int32
-
-  def initialize(@value : Int32)
-  end
-end
-
 class Doubler < Plugboard::Plugin
   def setup : Nil
     ctx.intercept(Note) { |note, nxt| nxt.call(Note.new(note.value * 2)) }
@@ -52,7 +45,7 @@ class Journal < Plugboard::Plugin
   getter lines = [] of String
 
   def setup : Nil
-    ctx.session do
+    ctx.while_running do
       @lines << "start"
       -> { @lines << "stop"; nil }
     end
@@ -70,14 +63,29 @@ class Breaker < Plugboard::Plugin
   end
 end
 
+class Dock < Plugboard::Plugin
+end
+
+class Banner
+  getter text : String
+
+  def initialize(@text : String)
+  end
+end
+
 Plugboard.service journal : Journal
+Plugboard.slot dock : Dock
+Plugboard.slot banner : Banner
+
+module Plugboard::Scope
+  def tally(into : Array(String), label : String) : Plugboard::Disposable
+    into << "+#{label}"
+    defer { into << "-#{label}"; nil }
+  end
+end
 
 private def bare : Plugboard::App
   Plugboard::App.new
-end
-
-private def boom : Plugboard::Message
-  raise "loader failed"
 end
 
 private def flop : Int32
@@ -148,9 +156,9 @@ describe Plugboard::Context do
     effects = Array.new(10_000) { scope.effect { -> { disposed += 1; nil } } }
     effects[5_000].dispose
     disposed.should eq 1
-    effects[4_999].slot.should be >= 0
-    effects[5_001].slot.should be >= 0
-    effects[5_000].slot.should eq -1
+    effects[4_999].held_index.should be >= 0
+    effects[5_001].held_index.should be >= 0
+    effects[5_000].held_index.should eq -1
     scope.dispose
     disposed.should eq 10_000
   end
@@ -297,6 +305,18 @@ describe Plugboard::Topic do
     topic.empty?.should be_true
   end
 
+  it "removes one registration of a proc registered twice" do
+    topic = Plugboard::Topic(Int32).new
+    seen = 0
+    listener = ->(value : Int32) { seen += value; nil }
+    topic.listen(listener)
+    topic.listen(listener)
+    topic.unlisten(listener)
+    topic.emit(1)
+    seen.should eq 1
+    topic.size.should eq 1
+  end
+
   it "counts listeners and handlers but not interceptors" do
     topic = Plugboard::Topic(Int32).new
     topic.empty?.should be_true
@@ -336,14 +356,14 @@ describe Plugboard::Bus do
 end
 
 describe Plugboard::App do
-  it "starts session effects with the run loop and stops them in reverse" do
+  it "starts run scopes with the run loop and stops them in reverse" do
     app = bare
     lines = [] of String
-    app.session do
+    app.while_running do
       lines << "a on"
       -> { lines << "a off"; nil }
     end
-    late = app.session do
+    late = app.while_running do
       lines << "b on"
       -> { lines << "b off"; nil }
     end
@@ -355,11 +375,11 @@ describe Plugboard::App do
     lines.should eq ["a on", "b on", "b off", "a off", "a on", "a off"]
   end
 
-  it "starts a session effect immediately when added to a running app" do
+  it "starts a run scope immediately when added to a running app" do
     app = bare
     lines = [] of String
     app.after(10.milliseconds) do
-      mode = app.session do
+      mode = app.while_running do
         lines << "on"
         -> { lines << "off"; nil }
       end
@@ -462,35 +482,53 @@ describe Plugboard::App do
     seen.should be > 0
   end
 
-  it "keeps the loop alive while async work occupies a worker" do
+  it "keeps the loop alive while fire-and-forget work occupies a worker" do
     app = bare
     release = Atomic(Bool).new(false)
     value = 0
-    app.on(Plugboard::MessageEvent) do |event|
-      message = event.message
-      value = message.value if message.is_a?(Loaded)
-    end
+    app.on(Note) { |note| value = note.value }
     app.after(20.milliseconds) { release.set(true) }
-    app.async do
-      limit = Time.instant + 500.milliseconds
-      while !release.get && Time.instant < limit
+    app.after(5.milliseconds) do
+      app.async do
+        limit = Time.instant + 500.milliseconds
+        while !release.get && Time.instant < limit
+        end
+        app.post(Note.new(release.get ? 1 : 0))
       end
-      Loaded.new(release.get ? 1 : 0)
     end
     cycle(app, 200.milliseconds)
     value.should eq 1
   end
 
-  it "reports an async failure as a message" do
+  it "routes a fire-and-forget failure through the error policy" do
     app = bare
-    seen = nil.as(String?)
-    app.on(Plugboard::MessageEvent) do |event|
-      message = event.message
-      seen = message.error.message if message.is_a?(Plugboard::AsyncError)
+    errors = [] of String
+    app.on(Plugboard::ErrorEvent) do |event|
+      errors << (event.error.message || "")
+      event.handle
     end
-    app.async { boom }
+    app.after(5.milliseconds) { app.async { flop } }
     cycle(app)
-    seen.should eq "loader failed"
+    errors.should eq ["work failed"]
+  end
+
+  it "releases a finished fire-and-forget lease and cancels a disposed one" do
+    app = bare
+    finished = nil.as(Plugboard::Disposable?)
+    cancelled = Atomic(Bool).new(false)
+    app.after(5.milliseconds) do
+      finished = app.async { }
+      lease = app.async do |token|
+        limit = Time.instant + 500.milliseconds
+        while !token.cancelled? && Time.instant < limit
+        end
+        cancelled.set(token.cancelled?)
+      end
+      app.after(10.milliseconds) { lease.dispose }
+    end
+    cycle(app, 200.milliseconds)
+    finished.as(Plugboard::Job).live?.should be_false
+    cancelled.get.should be_true
   end
 
   it "cancels a timer from another fiber" do
@@ -667,5 +705,141 @@ describe Plugboard::App do
     cycle(app, 200.milliseconds)
     cancelled.get.should be_true
     called.should be_false
+  end
+
+  it "renders when woken dirty from another fiber" do
+    app = bare
+    renders = 0
+    app.on(Plugboard::RenderEvent) { renders += 1 }
+    spawn app.run
+    sleep 10.milliseconds
+    done = Channel(Nil).new
+    spawn do
+      app.wake(dirty: true)
+      done.send(nil)
+    end
+    done.receive
+    sleep 30.milliseconds
+    app.stop
+    sleep 40.milliseconds
+    renders.should eq 1
+  end
+
+  it "holds renders until the last hold is released" do
+    app = bare
+    trail = [] of String
+    app.on(Plugboard::RenderEvent) { trail << "render" }
+    app.on(Plugboard::FlushEvent) { |flush| trail << "drawn" if flush.rendered? }
+    first = nil.as(Plugboard::Disposable?)
+    second = nil.as(Plugboard::Disposable?)
+    app.after(5.milliseconds) do
+      first = app.hold_render
+      second = app.hold_render
+      app.emit(Note.new(1))
+    end
+    app.after(20.milliseconds) do
+      trail << "one"
+      first.try(&.dispose)
+    end
+    app.after(35.milliseconds) do
+      trail << "two"
+      app.renders_held?.should be_true
+      second.try(&.dispose)
+    end
+    cycle(app, 80.milliseconds)
+    trail.should eq ["one", "two", "render", "drawn"]
+    app.renders_held?.should be_false
+  end
+
+  it "disposes its root scope and starts over with a fresh one" do
+    app = bare
+    seen = [] of Int32
+    collector = app.plugin(Collector)
+    journal = app.journal
+    root = app.root
+    app.dispose
+    collector.ctx.disposed?.should be_true
+    root.disposed?.should be_true
+    app.journal?.should be_nil
+    app.root.should_not be(root)
+    app.on(Note) { |note| seen << note.value }
+    app.emit(Note.new(1))
+    seen.should eq [1]
+    collector.values.should be_empty
+    journal.ctx.disposed?.should be_true
+  end
+end
+
+describe Plugboard::Scope do
+  it "reaches an extension from the app and from any scope" do
+    app = bare
+    trail = [] of String
+    app.tally(trail, "root")
+    scope = app.nest
+    scope.tally(trail, "inner")
+    scope.dispose
+    app.dispose
+    trail.should eq ["+root", "+inner", "-inner", "-root"]
+  end
+
+  it "runs a deferred undo when its scope is disposed" do
+    app = bare
+    trail = [] of String
+    scope = app.nest
+    scope.defer { trail << "undone" }
+    trail.should be_empty
+    scope.dispose
+    trail.should eq ["undone"]
+  end
+
+  it "attaches a plugin slot and clears it when the plugin is disposed" do
+    app = bare
+    app.dock?.should be_nil
+    expect_raises(Exception, "plugboard: no Dock is attached as dock") { app.dock }
+    dock = app.plugin(Dock)
+    app.dock = dock
+    app.dock.should be(dock)
+    app.nest.dock.should be(dock)
+    dock.dispose
+    app.dock?.should be_nil
+  end
+
+  it "attaches a plain slot until it is replaced" do
+    app = bare
+    app.banner = Banner.new("first")
+    app.root.banner.text.should eq "first"
+    app.banner = nil
+    app.root.banner?.should be_nil
+  end
+
+  it "keeps a replaced plugin slot when the old plugin goes away" do
+    app = bare
+    old = app.plugin(Dock)
+    app.dock = old
+    fresh = app.plugin(Dock)
+    app.dock = fresh
+    old.dispose
+    app.dock.should be(fresh)
+  end
+
+  it "tells observers whether a handler took the event" do
+    app = bare
+    trail = [] of String
+    app.observe(Note) { |note, taken| trail << "#{note.value}:#{taken}" }
+    app.handle(Note) { |note| trail << "handler"; note.value.even? }
+    app.emit(Note.new(1))
+    app.emit(Note.new(2))
+    trail.should eq ["handler", "1:false", "handler", "2:true"]
+  end
+
+  it "marks a flush as rendered only on a pass that rendered" do
+    app = bare
+    flushes = [] of Bool
+    app.on(Plugboard::FlushEvent) { |flush| flushes << flush.rendered? unless flush.final? }
+    app.after(5.milliseconds) { app.emit(Note.new(1)) }
+    app.after(20.milliseconds) { app.emit(Answer.new) }
+    cycle(app)
+    flushes.first(2).should eq [false, true]
+    flushes.count(true).should eq 1
   end
 end

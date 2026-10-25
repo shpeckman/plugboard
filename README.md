@@ -35,8 +35,8 @@ app.run
 - [Listening, handling and intercepting](#listening-handling-and-intercepting)
 - [Scopes](#scopes)
 - [Plugins](#plugins)
-- [Services](#services)
-- [Sessions](#sessions)
+- [Services and slots](#services-and-slots)
+- [Run scopes](#run-scopes)
 - [Timers](#timers)
 - [The run loop](#the-run-loop)
 - [Flushing](#flushing)
@@ -85,7 +85,8 @@ gives each type its own topic on the bus, so dispatch needs no hash lookup and
 no casting.
 
 Types are resolved from the top level, so give the full path for a type inside
-a module: `Plugboard.events MyApp::Tick`.
+a module: `Plugboard.events MyApp::Tick`. Emitting or posting a type that was
+never registered fails to compile with a message naming the type.
 
 There are two ways to send an event:
 
@@ -126,15 +127,20 @@ app.on(Resized) { |event| puts "#{event.cols}x#{event.rows}" }
 
 app.handle(Resized) { |event| event.cols < 20 }
 
+app.observe(Resized) { |event, taken| puts "unhandled" unless taken }
+
 app.intercept(Resized) do |event, pass|
   pass.call(event) if event.rows > 0
 end
 ```
 
-- **`on`** registers a listener. Every listener sees every event.
+- **`on`** registers a listener. Every listener sees every event, before any
+  handler, so it cannot tell whether the event will be taken.
 - **`handle`** registers a handler. Handlers are offered the event in
   registration order, after the listeners, and the first one to return `true`
   stops the rest and makes `emit` return `true`.
+- **`observe`** registers an observer. Observers run last, after the handlers,
+  and receive whether one of them took the event.
 - **`intercept`** registers middleware that runs before listeners and handlers.
   It receives the event and a proc. Call the proc to pass the event on, with
   the same event or a replacement, or do not call it to swallow the event.
@@ -149,13 +155,15 @@ end
 ```
 
 A dispatch always runs on the hooks as they were when it started. A hook that
-removes itself, or another hook, takes effect from the next event.
+removes itself, or another hook, takes effect from the next event. Order within
+one dispatch is fixed: interceptors, listeners, handlers, observers.
 
 ## Scopes
 
 A `Plugboard::Context` is an ownership scope. Everything registered through it
-is undone, in reverse order, when the scope is disposed. `App` forwards the
-same methods to its root scope.
+is undone, in reverse order, when the scope is disposed. The registration
+methods live in the `Plugboard::Scope` module, which both `Context` and `App`
+include; on an app they act on its root scope.
 
 ```crystal
 scope = app.nest
@@ -165,18 +173,38 @@ scope.effect do
   puts "opened"
   -> { puts "closed"; nil }
 end
+file = File.open("/tmp/log", "a")
+scope.defer { file.close }
 scope.dispose
 ```
 
 `effect` runs its block at once and keeps the returned proc as the undo step.
-`scope.nest` creates a child that is disposed with its parent. `own` adopts
-any object that includes `Plugboard::Disposable`.
+`defer` registers an undo step for work that is already done. `scope.nest`
+creates a child that is disposed with its parent. `own` adopts any object that
+includes `Plugboard::Disposable`; anything else fails to compile.
 
 Releasing one item early — disposing an `Effect`, cancelling a `Timer`,
 disposing a child scope — costs the same however many items the scope holds,
 and the rest are still undone newest first. Each `Disposable` records where its
 scope keeps it, so an item can be owned by **one scope at a time**. To move an
 item, `disown` it first.
+
+### Extending scopes
+
+Reopen `Plugboard::Scope` to add a scoped helper once and reach it from the app
+and from every scope. Inside, `scope` is the context the call acts on:
+
+```crystal
+module Plugboard::Scope
+  def log_lifetime(name : String) : Plugboard::Disposable
+    puts "#{name} up"
+    defer { puts "#{name} down" }
+  end
+end
+
+app.log_lifetime("root")
+app.nest.log_lifetime("child")
+```
 
 ### Standalone topics
 
@@ -231,7 +259,7 @@ scope is disposed before the error continues. Disposing a plugin disposes its
 scope, which removes everything the plugin registered, including plugins it
 installed through `ctx.plugin`.
 
-## Services
+## Services and slots
 
 A service is a plugin with a single shared instance, created on first use.
 
@@ -250,31 +278,49 @@ app.counter.ticks
 app.counter?
 ```
 
-The declaration adds three methods: `app.counter` installs the service if
-needed and returns it, `app.counter?` returns it only if it is installed, and
-`ctx.counter` reaches it from any scope. Disposing the service clears it, and
-the next call to `app.counter` installs a fresh one.
+The declaration adds `counter`, which installs the service if needed and returns
+it, and `counter?`, which returns it only if it is installed, to the app and to
+every scope. Disposing the service clears it, and the next call to `counter`
+installs a fresh one.
 
-Declare the service after its class, since the type is resolved where the
-declaration appears.
+A slot is a shared instance that the program builds itself and attaches:
 
-## Sessions
+```crystal
+class Screen
+  getter cols = 80
+end
 
-A session is an effect tied to the run loop. Its setup runs when the loop
+Plugboard.slot screen : Screen
+
+app.screen = Screen.new
+app.nest.screen.cols
+app.screen?
+```
+
+The declaration adds `screen=` to the app, and `screen` and `screen?` to the
+app and to every scope. `screen` raises when nothing is attached. When the type
+is a `Plugin`, disposing the attached plugin clears the slot, unless another
+instance has been attached since.
+
+Declare a service or a slot after its class, since the type is resolved where
+the declaration appears.
+
+## Run scopes
+
+A run scope is an effect tied to the run loop. Its setup runs when the loop
 starts and its undo runs when the loop stops, so it suits state that must not
 outlive the run, such as terminal modes.
 
 ```crystal
-app.session do
+app.while_running do
   print "\e[?1049h"
   -> { print "\e[?1049l"; nil }
 end
 ```
 
-Sessions start in the order they were added and stop in reverse. A session
-added while the loop is running starts at once. Every session is stopped on the
-way out, even when the loop ends with an error or another session's undo
-raises.
+Run scopes start in the order they were added and stop in reverse. One added
+while the loop is running starts at once. Every run scope is stopped on the way
+out, even when the loop ends with an error or another one's undo raises.
 
 ## Timers
 
@@ -312,22 +358,28 @@ returns the clock's current instant.
 3. Delivers everything that has been posted, including what handlers post
    along the way.
 4. Emits `Plugboard::IdleEvent`.
-5. Emits `Plugboard::RenderEvent`, only if the app is dirty.
+5. Emits `Plugboard::RenderEvent`, only if the app is dirty and no render
+   hold is active.
 6. Emits `Plugboard::FlushEvent`.
 
-The app becomes dirty when a non-reply event is emitted or when
-`app.invalidate` is called. Many events in one pass therefore produce one
-render.
+The app becomes dirty when a non-`Quiet` event is emitted, when
+`app.invalidate` is called on the loop, or when `app.wake(dirty: true)` is
+called from any fiber. Many events in one pass therefore produce one render.
 
 `app.stop` takes effect at once: it sets a flag and wakes the loop, so it never
 blocks and never waits for room in a queue. The loop finishes the step it is on
 and returns, which means events still queued when `stop` is called are
 abandoned rather than delivered. Anything that must happen on the way out
-belongs in a session's undo step or a `StoppedEvent` listener.
+belongs in a run scope's undo step or a `StoppedEvent` listener.
 
-The loop also emits a `FlushEvent` once the sessions have started, before the
-first pass. On the way out it stops the sessions, emits `Plugboard::StoppedEvent`
-and then a final `FlushEvent`, whose `final?` is true. `run` can be called again afterwards.
+The loop also emits a `FlushEvent` once the run scopes have started, before the
+first pass. On the way out it stops the run scopes, emits `Plugboard::StoppedEvent`
+and then a final `FlushEvent`, whose `final?` is true. `run` can be called again
+afterwards: plugins, services, timers and run scopes stay installed.
+
+`app.dispose` tears the app down: it stops the loop if it is running and
+disposes the root scope, which removes every plugin, service, timer, run scope
+and registration. The next use of the app builds a fresh root scope.
 
 The queue is unbounded, so posting never blocks the producer, including before
 `run` has started. `app.pending` reports how much is waiting.
@@ -349,8 +401,8 @@ end
 ```
 
 `FlushEvent` comes after `RenderEvent`, so a frame rendered on this pass is
-complete when it arrives. The last one, emitted after `StoppedEvent`, has
-`final?` set: anything written on the way out — by a session's undo or a
+complete when it arrives, and `rendered?` says whether one was. The last one, emitted after `StoppedEvent`, has
+`final?` set: anything written on the way out — by a run scope's undo or a
 `StoppedEvent` listener — is collected by then, and a listener that writes on
 another thread should wait for that write to finish before returning.
 
@@ -358,45 +410,49 @@ An exception raised by a `FlushEvent` listener is not reported as an
 `ErrorEvent`: it unwinds the loop, since output that cannot be written leaves
 nothing to recover.
 
-To pace rendering to a slow output, intercept `RenderEvent` while a write is in
-flight, call `invalidate` instead of passing the event on, and wake the loop
-with `enqueue` when the write finishes. The app stays dirty, so it renders the
+To pace rendering to a slow output, take a render hold while a write is in
+flight and dispose it when the write lands:
+
+```crystal
+hold = nil.as(Plugboard::Disposable?)
+app.on(Plugboard::FlushEvent) do |flush|
+  next unless flush.rendered?
+  hold = app.hold_render
+  app.async do
+    STDOUT.flush
+    app.enqueue(-> { hold.try(&.dispose); nil })
+  end
+end
+```
+
+While any hold is active the loop skips `RenderEvent` but keeps the app dirty.
+Releasing the last hold wakes the loop if the app is dirty, so it renders the
 latest state once the output can take it.
 
 ## Background work
 
-`app.async` runs a block in a worker fiber and posts its result back to the
-loop. The result must be a `Plugboard::Message` subclass, and it arrives
-wrapped in a `Plugboard::MessageEvent`.
+`ctx.async` runs work in a worker fiber. The block form is fire and forget; the
+work reaches the loop by posting events:
 
 ```crystal
-class Loaded < Plugboard::Message
+struct Loaded
   getter lines : Int32
 
   def initialize(@lines : Int32)
   end
 end
 
-app.async { Loaded.new(File.read_lines("/etc/hosts").size) }
+Plugboard.events Loaded
 
-app.on(Plugboard::MessageEvent) do |event|
-  case message = event.message
-  when Loaded
-    puts "#{message.lines} lines"
-  when Plugboard::AsyncError
-    puts "failed: #{message.error.message || "unknown"}"
-  end
-end
+app.on(Loaded) { |event| puts "#{event.lines} lines" }
+app.async { app.post(Loaded.new(File.read_lines("/etc/hosts").size)) }
 ```
 
-If the block raises, the loop receives a `Plugboard::AsyncError` message
-carrying the exception.
-
-The block does not run in the loop's execution context. Each app owns a
+The work does not run in the loop's execution context. Each app owns a
 `Fiber::ExecutionContext::Parallel` named `plugboard.workers`, sized to
 `Fiber::ExecutionContext.default_workers_count` (the `CRYSTAL_WORKERS`
-environment variable, or the number of logical CPUs), so a block that holds
-its thread — CPU work, a blocking system call — stalls neither the loop nor the
+environment variable, or the number of logical CPUs), so work that holds its
+thread — CPU work, a blocking system call — stalls neither the loop nor the
 other workers. Pass a context of your own to size it differently, or to share
 one between several apps:
 
@@ -419,10 +475,8 @@ that never touches `async` or `workers` builds none at all.
 
 ### One reply to one caller
 
-The `Message` form broadcasts: every `MessageEvent` listener sees the result and
-has to sort out which message is theirs. When the result belongs to the call
-site that asked for it, pass the work as a proc and take the reply in a block.
-There is no message type to declare and no central listener to extend:
+When the result belongs to the call site that asked for it, pass the work as a
+proc and take the reply in a block:
 
 ```crystal
 lease = ctx.async(->{ File.read_lines("/etc/hosts").size }) do |lines|
@@ -434,21 +488,19 @@ The work runs in the worker context and the block runs on the loop. The result
 is published through the same mutex the queue uses, so the block sees it safely
 without any locking of your own.
 
-The returned disposable is owned by the scope. Disposing it, or disposing the
-scope, drops the reply: work already in flight still finishes, but the block is
-never called. That is what makes this safe to use from something that can go
-away while a load is outstanding, and it replaces the generation counters a
-caller would otherwise keep.
+### Leases, failures and cancellation
+
+Every form returns a lease, a `Plugboard::Job`, owned by the scope. Disposing
+it, or disposing the scope, drops the reply and any failure: work already in
+flight still finishes, but the reply block is never called. A lease releases
+itself once its work is done.
 
 If the work raises, the exception is re-raised on the loop and goes through
-[the error policy](#errors) rather than arriving as a message. A disposed lease
-discards the failure along with the result.
+[the error policy](#errors). There is one rule for every form.
 
-### Cancelling work in flight
-
-Disposing a lease drops the reply but cannot stop work that is already running.
-Take a `Plugboard::Token` as the work's argument and the work can stop itself:
-disposing the lease, or the scope that owns it, cancels the token.
+Disposing a lease cannot stop work that is already running, but it cancels the
+lease's `Plugboard::Token`. Take the token as the work's argument and the work
+can stop itself:
 
 ```crystal
 lease = ctx.async(->(token : Plugboard::Token) {
@@ -459,12 +511,17 @@ lease = ctx.async(->(token : Plugboard::Token) {
   end
   total
 }) { |total| puts total }
+
+ctx.async do |token|
+  until token.cancelled?
+    sleep 10.milliseconds
+  end
+end
 ```
 
 `token.cancelled?` is an atomic read, cheap enough to check inside a loop.
 
-Unlike the `Message` form, this one must be called from the loop's fiber, since
-it registers on a scope.
+`async` registers on a scope, so it must be called from the loop's fiber.
 
 ## Errors
 
@@ -500,14 +557,16 @@ These methods are safe to call from any fiber, in any execution context:
 |--------------------|-----------------------------------------------------|
 | `app.post`         | Hands the event to a mutex-guarded queue            |
 | `app.enqueue`      | Same queue; runs a proc on the loop                 |
+| `app.wake`         | An atomic dirty flag, then a wake-up                |
 | `app.stop`         | An atomic flag, then a wake-up                      |
-| `app.async { }`    | Spawns into the worker context and posts the result |
 | `timer.cancel`     | An atomic flag; the heap edit is deferred to the loop |
+| `token.cancel`     | An atomic flag                                      |
 
 Everything else must be called from the loop's fiber: `emit`, `on`, `handle`,
-`intercept`, `after`, `every`, `plugin`, `nest`, `effect`, `session`, `own`,
-`disown`, `dispose`, `report`, `pending` and `async(work, &done)`. In practice
-that means from inside a listener, handler, timer, session or plugin. Build
+`observe`, `intercept`, `after`, `every`, `plugin`, `nest`, `effect`, `defer`,
+`while_running`, `async`, `hold_render`, `invalidate`, `own`, `disown`,
+`dispose`, `report` and `pending`. In practice
+that means from inside a listener, handler, timer, run scope or plugin. Build
 with `-Dplugboard_assert` and each of them raises when called from anywhere
 else. The checks are off otherwise, in debug and release builds alike; turn
 them on for your test suite and for a development build.
@@ -520,9 +579,10 @@ past a parallelism of one, or the loop shares a context with fibers that run in
 parallel, the same call is a data race. The `-Dplugboard_assert` checks are
 the cheap way to find out before it matters.
 
-The worker context is separate from the loop's, so `async` blocks run in
-parallel with the loop, and with each other, by design. They communicate with
-the loop only through `post`, so nothing of the kernel's needs a lock.
+The worker context is separate from the loop's, so `async` work runs in
+parallel with the loop, and with each other, by design. It communicates with
+the loop only through `post`, `enqueue` and `wake`, so nothing of the kernel's
+needs a lock.
 
 Events posted from the loop's own fiber skip the mutex and go straight to a
 local deque. Both queues are unbounded: a producer is never blocked, and
@@ -543,29 +603,112 @@ Registering a type twice is harmless.
 
 `Plugboard.service(name : Type)`  
 Declares a service.  
-Adds `App#name`, `App#name?` and `Context#name`.  
+Adds `App#name`, `App#name?` and the same pair to `Scope`.  
 `Type` must be a `Plugin` whose constructor needs only the context, and must be declared before this line.  
+
+`Plugboard.slot(name : Type)`  
+Declares a slot for an instance the program attaches.  
+Adds `App#name=`, and `#name` (raises when empty) and `#name?` to `App` and `Scope`.  
+When `Type` is a `Plugin`, disposing the attached instance clears the slot.  
+
+`Plugboard.scoped(name, type)`  
+Adds `#name` and `#name?` to `Scope`, forwarding to the app. Used by `service` and `slot`.  
+
+`Plugboard.registered!(type)`  
+Fails compilation unless `type`, or every member of a union `type`, is a registered event. Used inside `emit` and `post`.  
+
+### Scope
+
+The registration API, included by both `Context` and `App`. Every method acts
+on `#scope`: the context itself, or the app's root scope. Each registration is
+owned by that scope and returns a `Disposable` that removes it. Reopen the
+module to add helpers of your own.
+
+`#scope : Context`  
+The scope the methods act on.  
+
+`#nest : Context`  
+A new child scope, disposed with this one.  
+
+`#plugin(type : P.class, *args, **options) : P`  
+Creates a child scope, builds `type` with it and the given arguments, calls `setup`, and returns the instance.  
+Disposes the child scope if either step raises.  
+
+`#effect(&setup : -> (-> Nil)) : Disposable`  
+Runs `setup` now and keeps its result as the undo step.  
+
+`#defer(&undo : -> Nil) : Disposable`  
+Keeps `undo` as an undo step, for work already done.  
+
+`#while_running(&setup : -> (-> Nil)) : Disposable`  
+Runs `setup` when the loop starts, or now if it is running, and its result when the loop stops.  
+
+`#on(type : T.class, &block : T -> Nil)`, `#on(topic : Topic(T), &block)`  
+Adds a listener for `T`, or to a standalone topic.  
+
+`#handle(type : T.class, &block : T -> Bool)`, `#handle(topic : Topic(T), &block)`  
+Adds a handler. Returning `true` stops later handlers.  
+
+`#observe(type : T.class, &block : T, Bool -> Nil)`, `#observe(topic : Topic(T), &block)`  
+Adds an observer, called after the handlers with whether one took the event.  
+
+`#intercept(type : T.class, &block : T, Proc(T, Nil) -> Nil)`  
+Adds an interceptor for `T`. Call the proc to pass the event on.  
+
+`#intercept(&block : Event, Proc(Event, Nil) -> Nil)`  
+Adds an interceptor for every event sent through `emit` or `post`.  
+
+`#after(span : Time::Span, &block : -> Nil) : Timer`  
+Calls the block once, `span` from now.  
+
+`#every(span : Time::Span, &block : -> Nil) : Timer`  
+Calls the block every `span`, first after one `span`.  
+
+`#async(&work : Token -> Nil) : Disposable`  
+Runs `work` in the worker context, fire and forget.  
+
+`#async(work : Proc(T), &done : T -> Nil) : Disposable`  
+Runs `work` in the worker context and calls `done` with its result on the loop.  
+
+`#async(work : Proc(Token, T), &done : T -> Nil) : Disposable`  
+As above, and passes `work` the lease's `Token`.  
+
+For every `async`: a failure is re-raised on the loop and goes through `report`; disposing the lease, or its scope, drops the reply and the failure and cancels the token.  
+
+`#hold_render : Disposable`  
+Holds back `RenderEvent` until disposed. Holds nest; see [Flushing](#flushing).  
+
+`#now : Time::Instant`  
+The app clock's current instant.  
+
+`#emit(event)`, `#post(event)`, `#invalidate`  
+Same as on `App`.  
 
 ### App
 
 The application: owns the bus, the timers, the queue and the root scope.
+Includes `Scope`.
 
 **Construction and lifecycle**
 
 `App.new(*, workers : Fiber::ExecutionContext? = nil, clock : Clock = Clock::SYSTEM) : App`  
 Creates an app.  
-`workers` is where `async` blocks run; the default is a `Fiber::ExecutionContext::Parallel` named `plugboard.workers`, sized to `default_workers_count` and built on first use.  
+`workers` is where `async` work runs; the default is a `Fiber::ExecutionContext::Parallel` named `plugboard.workers`, sized to `default_workers_count` and built on first use.  
 `clock` is where timers and the loop read the time; see [Timers](#timers).  
 
 `#run : Nil`  
-Starts the sessions and runs the loop until stopped.  
-Stops the sessions, emits `StoppedEvent` and a final `FlushEvent` on the way out, then raises the first error if there was one.  
+Starts the run scopes and runs the loop until stopped.  
+Stops the run scopes, emits `StoppedEvent` and a final `FlushEvent` on the way out, then raises the first error if there was one.  
 May be called again afterwards.  
 
 `#stop : Nil`  
 Stops the loop at the next step and wakes it.  
 Events still queued are abandoned.  
 Never blocks; safe from any fiber.  
+
+`#dispose : Nil`  
+Stops the loop if it is running and disposes the root scope.  
+The next use builds a fresh root scope.  
 
 `#running? : Bool`  
 Whether `run` is in progress.  
@@ -579,107 +722,49 @@ Raises unless `on_loop?`.
 Compiled out unless the program is built with `-Dplugboard_assert`.  
 
 `#workers : Fiber::ExecutionContext`  
-The context `async` blocks run in.  
+The context `async` work runs in.  
+
+`#clock : Clock`  
+The clock the app was built with.  
+
+`#app : App`  
+The app itself, so `scope.app` works on both an app and a context.  
 
 **Sending events**
 
-`#emit(event) : Bool`  
+`#emit(event : T) : Bool`  
 Delivers a registered event immediately.  
 Returns whether a handler took it.  
 Marks the app dirty unless the type includes `Quiet`.  
 
-`#post(event : Event) : Nil`  
-Queues an event for the loop's next pass.  
-Safe from any fiber.  
-
-`#post(message : Message) : Nil`  
-Queues a message wrapped in a `MessageEvent`.  
+`#post(event : T) : Nil`  
+Queues a registered event for the loop's next pass.  
 Safe from any fiber.  
 
 `#enqueue(action : -> Nil) : Nil`  
 Queues a proc to run on the loop.  
 Safe from any fiber.  
 
-`#async(&block : -> Message) : Nil`  
-Runs the block in the worker context and posts its result.  
-Posts an `AsyncError` if the block raises.  
-Safe from any fiber.  
-
-`#async(work : Proc(T), &done : T -> Nil) : Disposable`  
-Runs `work` in the worker context and calls `done` with its result on the loop.  
-Re-raises on the loop if `work` raises, so the error goes through `report`.  
-Disposing the result, or the scope that owns it, drops the reply.  
-
-`#async(work : Proc(Token, T), &done : T -> Nil) : Disposable`  
-As above, and passes `work` a `Token` that disposing the result cancels.  
-
-`#job(&work : -> Nil) : Nil`  
-Runs `work` on `workers`, counted in `jobs` until it returns; the loop is woken when the last job finishes. Every `async` runs through it.  
-
-`#jobs : Int32`  
-How many jobs are running right now.  
-
-`#clock : Clock`  
-The clock the app was built with.  
-
 `#pending : Int32`  
 How many events and procs are waiting to be delivered.  
 
-**Receiving events**
-
-Each of these registers on the root scope and returns a `Disposable` that
-removes the registration.
-
-`#on(type : T.class, &block : T -> Nil)`  
-Adds a listener for `T`.  
-
-`#on(topic : Topic(T), &block : T -> Nil)`  
-Adds a listener to a standalone topic.  
-
-`#handle(type : T.class, &block : T -> Bool)`  
-Adds a handler for `T`.  
-Returning `true` stops later handlers.  
-
-`#handle(topic : Topic(T), &block : T -> Bool)`  
-Adds a handler to a standalone topic.  
-
-`#intercept(type : T.class, &block : T, Proc(T, Nil) -> Nil)`  
-Adds an interceptor for `T`.  
-Call the proc to pass the event on.  
-
-`#intercept(&block : Event, Proc(Event, Nil) -> Nil)`  
-Adds an interceptor for every event sent through `emit` or `post`.  
-
-**Scopes, plugins and timers**
-
-`#root : Context`  
-The root scope.  
-
-`#nest : Context`  
-A new child of the root scope.  
-
-`#plugin(type : P.class, *args, **options) : P`  
-Installs a plugin under the root scope.  
-
-`#effect(&setup : -> (-> Nil)) : Disposable`  
-Runs `setup` now and keeps its result as the undo step.  
-
-`#session(&setup : -> (-> Nil)) : Disposable`  
-Runs `setup` when the loop starts, or now if it is running, and its result when the loop stops.  
-
-`#after(span : Time::Span, &block : -> Nil) : Timer`  
-Calls the block once, `span` from now.  
-
-`#every(span : Time::Span, &block : -> Nil) : Timer`  
-Calls the block every `span`, first after one `span`.  
+`#jobs : Int32`  
+How many `async` jobs are running right now. The loop is woken when the last one finishes.  
 
 **Rendering**
 
 `#invalidate : Nil`  
 Requests a `RenderEvent` on this pass.  
 
+`#wake(dirty : Bool = false) : Nil`  
+Wakes the loop, marking the app dirty first when `dirty` is true.  
+Safe from any fiber.  
+
 `#dirty? : Bool`  
 Whether a `RenderEvent` is pending.  
+
+`#renders_held? : Bool`  
+Whether a render hold is active.  
 
 **Errors**
 
@@ -690,24 +775,28 @@ The loop calls this for you; call it to route an error you caught yourself throu
 
 **Low level**
 
+`#root : Context`  
+The root scope.  
+
 `#bus : Bus`  
 The event bus.  
 
 `#timers : Timers`  
 The timer heap.  
 
-`#attach(session : Session) : Nil`  
-Adds a session to the run.  
-Used by `Context#session`.  
+`#attach(run : RunScope) : Nil`, `#detach(run : RunScope) : Nil`  
+Add a run scope to the run or remove it. Used by `while_running` and `RunScope#dispose`.  
 
-`#detach(session : Session) : Nil`  
-Removes a session from the run.  
-Used by `Session#dispose`.  
+`#dispatch(job : Job, &work : Token -> Nil) : Nil`  
+Runs `work` on `workers` for a live lease and counts it in `jobs`; a failure is re-raised on the loop unless the lease was disposed. Used by `async`.  
+
+`#hold_renders : Nil`, `#release_renders : Nil`  
+The counter behind `hold_render`. Releasing the last hold wakes the loop if the app is dirty.  
 
 ### Context
 
-An ownership scope. Includes `Disposable`. Obtain one from `App#root`,
-`App#nest`, `Context#nest` or `Plugin#ctx`.
+An ownership scope. Includes `Disposable` and `Scope`. Obtain one from
+`App#root`, `#nest` or `Plugin#ctx`.
 
 `#app : App`  
 The app this scope belongs to.  
@@ -715,40 +804,9 @@ The app this scope belongs to.
 `#parent : Context?`  
 The enclosing scope, `nil` for the root.  
 
-`#nest : Context`  
-A new child scope, disposed with this one.  
-
-`#plugin(type : P.class, *args, **options) : P`  
-Creates a child scope, builds `type` with it and the given arguments, calls `setup`, and returns the instance.  
-Disposes the child scope if either step raises.  
-
-`#on`, `#handle`, `#intercept`  
-As on `App`, owned by this scope, by event type or by standalone topic.  
-Each returns a `Disposable`.  
-
-`#async(work : Proc(T), &done : T -> Nil) : Disposable`  
-As on `App`, owned by this scope.  
-
-`#effect`, `#session`  
-As on `App`, owned by this scope.  
-Each returns a `Disposable`.  
-
-`#after`, `#every`  
-As on `App`, owned by this scope.  
-Each returns a `Timer`.  
-
-`#emit(event) : Bool`  
-Same as `App#emit`.  
-
-`#post(event) : Nil`  
-Same as `App#post`, for an event or a message.  
-Safe from any fiber.  
-
-`#invalidate`  
-Same as on `App`.  
-
 `#own(item : T) : T`  
-Makes this scope own `item`, which must include `Disposable`.  
+Makes this scope own `item`.  
+`T` must include `Disposable`, or compilation fails.  
 If the scope is already disposed, `item` is disposed at once.  
 An item must not be owned by two scopes at once.  
 
@@ -792,20 +850,25 @@ Disposes the plugin's scope.
 A module with one abstract method, `#dispose : Nil`. Include it in a type to
 let a scope own it through `Context#own`.
 
-It also carries `#slot : Int32`, the item's position in the scope that owns it,
-or `-1` when no scope does. `Context` maintains it; never set it yourself.
+It also carries `#held_index : Int32`, the item's position in the scope that
+owns it, or `-1` when no scope does. `Context` maintains it; never set it
+yourself.
 
 The kernel's own disposables:
 
 `Effect`  
-Created by `on`, `handle`, `intercept` and `effect`.  
+Created by `on`, `handle`, `observe`, `intercept`, `effect`, `defer` and `hold_render`.  
 `#dispose` runs the undo step once.  
-`Effect.new(owner : Context, undo : -> Nil)` builds one directly; pass it to `own`.  
 
-`Session`  
-Created by `session`.  
+`RunScope`  
+Created by `while_running`.  
 `#dispose` stops it if started and removes it from the run.  
 `#start` and `#stop` are called by the loop.  
+
+`Job`  
+Created by `async`.  
+`#dispose` drops the reply and cancels `#token`.  
+`#live? : Bool` is false once the job has finished or been disposed.  
 
 `Timer`  
 Created by `after` and `every`.  
@@ -840,7 +903,7 @@ Same as `cancel`.
 When the timer fires next.  
 
 `#serial`, `#heap_index`, `#fire`, `#advance` and `#before?` are used by the
-timer heap and are not meant to be called.
+timer heap and are not meant to be called.  
 
 ### Token
 
@@ -865,29 +928,19 @@ Emitting a type that includes it does not mark the app dirty.
 Emitted once per pass, after the queue is empty and before rendering.  
 
 `RenderEvent` (struct)  
-Emitted once per pass if the app is dirty.  
+Emitted once per pass if the app is dirty and no render hold is active.  
 
 `FlushEvent` (struct)  
-Emitted at the end of every pass, once after the sessions start, and once more after `StoppedEvent`.  
+Emitted at the end of every pass, once after the run scopes start, and once more after `StoppedEvent`.  
 `#final? : Bool` is true only for that last one.  
+`#rendered? : Bool` is true when the pass emitted a `RenderEvent`.  
 
 `StoppedEvent` (struct)  
-Emitted once when `run` ends, after the sessions have stopped.  
-
-`MessageEvent` (struct)  
-Carries a posted message.  
-`#message : Message`.  
+Emitted once when `run` ends, after the run scopes have stopped.  
 
 `ErrorEvent` (class)  
 Carries an error raised on the loop.  
 `#error : Exception`, `#handle : Nil`, `#handled? : Bool`.  
-
-`Message` (abstract class)  
-Base class for values posted with `App#post(message)` or returned from `async`.  
-
-`AsyncError` (class)  
-A `Message` carrying the exception from a failed `async` block.  
-`#error : Exception`.  
 
 `Fault` (class)  
 An `Exception` raised when a second failure follows the one being handled.  
@@ -898,13 +951,13 @@ The registered types, readable in macros as `::Plugboard::EVENT_TYPES`.
 Complete only once the whole program has been read, so use it inside a method body or `macro finished`.  
 
 The loop sends `IdleEvent`, `RenderEvent`, `FlushEvent`, `StoppedEvent` and `ErrorEvent`
-straight to their topics. Typed interceptors, listeners and handlers see them;
-the untyped `intercept` does not.
+straight to their topics. Typed interceptors, listeners, handlers and observers
+see them; the untyped `intercept` does not.
 
-### Bus, Topic and Chain
+### Bus, Topic, Chain and Roster
 
-The machinery behind `on`, `handle` and `intercept`. Registrations made here
-directly are not owned by any scope, so prefer the `Context` methods.
+The machinery behind `on`, `handle`, `observe` and `intercept`. Registrations
+made here directly are not owned by any scope, so prefer the `Scope` methods.
 
 `Bus#topic(type : T.class) : Topic(T)`  
 The topic for a registered type.  
@@ -924,8 +977,8 @@ Sends an event through the topic's interceptors, then delivers it.
 Returns `false` when an interceptor swallows the event, since no handler saw it.  
 
 `Topic(T)#deliver(event : T) : Bool`  
-Calls every listener, then the handlers until one returns `true`.  
-Returns whether one did.  
+Calls every listener, then the handlers until one returns `true`, then every observer with that answer.  
+Returns whether a handler took it.  
 
 `Topic(T)#listen(listener)`, `#unlisten(listener)`  
 Adds or removes a `T -> Nil` proc.  
@@ -933,11 +986,14 @@ Adds or removes a `T -> Nil` proc.
 `Topic(T)#handle(handler)`, `#unhandle(handler)`  
 Adds or removes a `T -> Bool` proc.  
 
+`Topic(T)#observe(observer)`, `#unobserve(observer)`  
+Adds or removes a `T, Bool -> Nil` proc.  
+
 `Topic(T)#intercept(link)`, `#unintercept(link)`  
 Adds or removes a `Proc(T, Proc(T, Nil), Nil)`.  
 
 `Topic(T)#size : Int32`, `#empty? : Bool`  
-How many listeners and handlers are registered, and whether there are none.  
+How many listeners, handlers and observers are registered, and whether there are none.  
 Interceptors are not counted.  
 
 `Chain(T)#add(link)`, `#remove(link)`  
@@ -953,7 +1009,12 @@ The `T -> Bool` proc called at the end of the chain.
 `Chain(T)#empty? : Bool`  
 Whether the chain has no interceptors.  
 
-Removal compares procs, so keep the proc you registered in order to remove it.
+`Roster(T)`  
+The copy-on-write list behind topics and chains: `#add`, `#remove`, `#each`, `#size`, `#empty?`, `#to_a`.  
+`#each` walks the list as it was when the walk started.  
+
+Removal compares procs and removes the first match only, so keep the proc you
+registered in order to remove it; a proc registered twice needs two removals.
 
 ### Internal types
 
@@ -962,8 +1023,8 @@ methods may change without notice.
 
 ## Limits
 
-- Events must be registered at compile time. A type that was never passed to
-  `Plugboard.events` cannot be emitted.
+- Events must be registered at compile time. Emitting or posting a type that
+  was never passed to `Plugboard.events` fails to compile.
 - Handlers have no priority. They run in registration order.
 - The queue is unbounded by design, so a producer that outruns the loop grows
   it rather than being held back. Watch `app.pending` if that matters.

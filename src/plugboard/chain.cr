@@ -1,11 +1,14 @@
 # src/plugboard/chain.cr
+require "./roster"
+
 class Plugboard::Chain(T)
   property sink : T -> Bool
 
   def initialize
-    @links = [] of Proc(T, Proc(T, Nil), Nil)
-    @nexts = [] of Proc(T, Nil)
-    @sink  = ->(event : T) { false }
+    @links  = Roster(Proc(T, Proc(T, Nil), Nil)).new
+    @steps  = [] of Proc(T, Proc(T, Nil), Nil)
+    @nexts  = [] of Proc(T, Nil)
+    @sink   = ->(event : T) { false }
     @result = false
   end
 
@@ -14,40 +17,39 @@ class Plugboard::Chain(T)
   end
 
   def add(link : Proc(T, Proc(T, Nil), Nil)) : Nil
-    rebuild(@links + [link])
+    @links.add(link)
+    rebuild
   end
 
   def remove(link : Proc(T, Proc(T, Nil), Nil)) : Nil
-    index = @links.index(link) || return
-    links = @links.dup
-    links.delete_at(index)
-    rebuild(links)
+    rebuild if @links.remove(link)
   end
 
   def run(event : T) : Bool
     held    = @result
     @result = false
     begin
-      step(@links, @nexts, 0, event)
+      step(@steps, @nexts, 0, event)
       @result
     ensure
       @result = held
     end
   end
 
-  private def rebuild(links : Array(Proc(T, Proc(T, Nil), Nil))) : Nil
-    nexts = Array(Proc(T, Nil)).new(links.size)
-    links.size.times do |index|
-      nexts << ->(event : T) { step(links, nexts, index + 1, event) }
+  private def rebuild : Nil
+    steps = @links.to_a
+    nexts = Array(Proc(T, Nil)).new(steps.size)
+    steps.size.times do |index|
+      nexts << ->(event : T) { step(steps, nexts, index + 1, event) }
     end
-    @links = links
+    @steps = steps
     @nexts = nexts
   end
 
-  private def step(links : Array(Proc(T, Proc(T, Nil), Nil)), nexts : Array(Proc(T, Nil)),
+  private def step(steps : Array(Proc(T, Proc(T, Nil), Nil)), nexts : Array(Proc(T, Nil)),
                    index : Int32, event : T) : Nil
-    if index < links.size
-      links.unsafe_fetch(index).call(event, nexts.unsafe_fetch(index))
+    if index < steps.size
+      steps.unsafe_fetch(index).call(event, nexts.unsafe_fetch(index))
     else
       @result = @sink.call(event)
     end

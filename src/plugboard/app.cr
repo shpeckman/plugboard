@@ -1,5 +1,7 @@
 # src/plugboard/app.cr
 class Plugboard::App
+  include Scope
+
   getter bus    : Bus
   getter timers : Timers
   getter clock  : Clock
@@ -18,10 +20,11 @@ class Plugboard::App
     @mutex     = Sync::Mutex.new
     @bell      = Channel(Nil).new(1)
     @ringing   = false
-    @sessions  = [] of Session
+    @runs      = [] of RunScope
     @running   = Atomic(Bool).new(false)
     @stopping  = Atomic(Bool).new(false)
-    @dirty     = false
+    @dirty     = Atomic(Bool).new(false)
+    @holds     = 0
     @reporting = false
     @root      = nil
     @owner     = nil
@@ -50,69 +53,27 @@ class Plugboard::App
     {% end %}
   end
 
+  def app : App
+    self
+  end
+
   def root : Context
     @root ||= Context.new(self)
   end
 
-  def nest : Context
-    root.nest
+  def scope : Context
+    root
   end
 
-  def plugin(type : P.class, *args, **options) : P forall P
-    root.plugin(type, *args, **options)
-  end
-
-  def effect(&setup : -> (-> Nil)) : Disposable
-    root.effect(&setup)
-  end
-
-  def session(&setup : -> (-> Nil)) : Disposable
-    root.session(&setup)
-  end
-
-  def on(type : T.class, &block : T -> Nil) : Disposable forall T
-    root.on(type, &block)
-  end
-
-  def on(topic : Topic(T), &block : T -> Nil) : Disposable forall T
-    root.on(topic, &block)
-  end
-
-  def handle(type : T.class, &block : T -> Bool) : Disposable forall T
-    root.handle(type, &block)
-  end
-
-  def handle(topic : Topic(T), &block : T -> Bool) : Disposable forall T
-    root.handle(topic, &block)
-  end
-
-  def intercept(type : T.class, &block : T, Proc(T, Nil) -> Nil) : Disposable forall T
-    root.intercept(type, &block)
-  end
-
-  def intercept(&block : Event, Proc(Event, Nil) -> Nil) : Disposable
-    root.intercept(&block)
-  end
-
-  def after(span : Time::Span, &block : -> Nil) : Timer
-    root.after(span, &block)
-  end
-
-  def every(span : Time::Span, &block : -> Nil) : Timer
-    root.every(span, &block)
-  end
-
-  def emit(event) : Bool
+  def emit(event : T) : Bool forall T
+    ::Plugboard.registered!(T)
     assert_loop
-    @dirty = true unless event.is_a?(Quiet)
+    @dirty.set(true, :relaxed) unless event.is_a?(Quiet)
     @bus.emit(event)
   end
 
-  def post(message : Message) : Nil
-    submit(MessageEvent.new(message))
-  end
-
-  def post(event : Event) : Nil
+  def post(event : T) : Nil forall T
+    ::Plugboard.registered!(T)
     submit(event)
   end
 
@@ -120,21 +81,21 @@ class Plugboard::App
     submit(Action.new(action))
   end
 
-  def async(&block : -> Message) : Nil
-    job do
-      begin
-        post(block.call)
-      rescue ex
-        post(AsyncError.new(ex))
-      end
-    end
+  def wake(dirty : Bool = false) : Nil
+    @dirty.set(true) if dirty
+    ring
   end
 
-  def job(&work : -> Nil) : Nil
+  def dispatch(job : Job, &work : Token -> Nil) : Nil
+    assert_loop
+    return unless job.live?
+    token = job.token
     @jobs.add(1)
-    workers.spawn(name: "plugboard.async") do
+    workers.spawn(name: "plugboard.job") do
       begin
-        work.call
+        work.call(token)
+      rescue error
+        enqueue(-> { job.fail(error); nil })
       ensure
         ring if @jobs.sub(1) == 1
       end
@@ -143,14 +104,6 @@ class Plugboard::App
 
   def jobs : Int32
     @jobs.get
-  end
-
-  def async(work : Proc(T), &done : T -> Nil) : Disposable forall T
-    root.async(work, &done)
-  end
-
-  def async(work : Proc(Token, T), &done : T -> Nil) : Disposable forall T
-    root.async(work, &done)
   end
 
   def pending : Int32
@@ -175,11 +128,27 @@ class Plugboard::App
   end
 
   def invalidate : Nil
-    @dirty = true
+    assert_loop
+    @dirty.set(true, :relaxed)
   end
 
   def dirty? : Bool
-    @dirty
+    @dirty.get(:relaxed)
+  end
+
+  def hold_renders : Nil
+    assert_loop
+    @holds += 1
+  end
+
+  def release_renders : Nil
+    assert_loop
+    @holds -= 1
+    ring if @holds == 0 && dirty?
+  end
+
+  def renders_held? : Bool
+    @holds > 0
   end
 
   def run : Nil
@@ -188,13 +157,12 @@ class Plugboard::App
     failure = nil.as(Exception?)
     @clock.watch(@wake)
     begin
-      start_sessions
+      start_runs
       flush
       until @stopping.get
         await
         drain
-        render
-        flush
+        flush(rendered: render)
       end
     rescue error
       failure = error
@@ -208,13 +176,21 @@ class Plugboard::App
     ring
   end
 
-  def attach(session : Session) : Nil
-    @sessions << session
-    session.start if running?
+  def dispose : Nil
+    assert_loop
+    root = @root || return
+    stop if running?
+    @root = nil
+    root.dispose
   end
 
-  def detach(session : Session) : Nil
-    @sessions.delete(session)
+  def attach(run : RunScope) : Nil
+    @runs << run
+    run.start if running?
+  end
+
+  def detach(run : RunScope) : Nil
+    @runs.delete(run)
   end
 
   private def submit(item : Event | Action) : Nil
@@ -254,19 +230,19 @@ class Plugboard::App
     end
   end
 
-  private def start_sessions : Nil
+  private def start_runs : Nil
     index = 0
-    while index < @sessions.size
-      @sessions.unsafe_fetch(index).start
+    while index < @runs.size
+      @runs.unsafe_fetch(index).start
       index += 1
     end
   end
 
   private def shutdown(failure : Exception?) : Exception?
     @clock.unwatch(@wake)
-    @sessions.dup.reverse_each do |session|
+    @runs.dup.reverse_each do |run|
       begin
-        session.stop
+        run.stop
       rescue error
         failure ||= error
       end
@@ -324,10 +300,11 @@ class Plugboard::App
     end
   end
 
-  private def render : Nil
-    return unless @dirty
-    @dirty = false
+  private def render : Bool
+    return false if @holds > 0
+    return false unless @dirty.swap(false)
     guard { @bus.topic(RenderEvent).emit(RenderEvent.new) }
+    true
   end
 
   private def guard(& : -> Nil) : Nil
@@ -336,7 +313,7 @@ class Plugboard::App
     report(error)
   end
 
-  private def flush(final : Bool = false) : Nil
-    @bus.topic(FlushEvent).emit(FlushEvent.new(final))
+  private def flush(*, final : Bool = false, rendered : Bool = false) : Nil
+    @bus.topic(FlushEvent).emit(FlushEvent.new(final: final, rendered: rendered))
   end
 end

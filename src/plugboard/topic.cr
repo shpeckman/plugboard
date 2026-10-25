@@ -1,20 +1,22 @@
 # src/plugboard/topic.cr
+require "./roster"
 require "./chain"
 
 class Plugboard::Topic(T)
   def initialize
     @chain     = Chain(T).new
-    @listeners = [] of T -> Nil
-    @handlers  = [] of T -> Bool
+    @listeners = Roster(T -> Nil).new
+    @handlers  = Roster(T -> Bool).new
+    @observers = Roster(T, Bool -> Nil).new
     @chain.sink = ->(event : T) { deliver(event) }
   end
 
   def size : Int32
-    @listeners.size + @handlers.size
+    @listeners.size + @handlers.size + @observers.size
   end
 
   def empty? : Bool
-    @listeners.empty? && @handlers.empty?
+    @listeners.empty? && @handlers.empty? && @observers.empty?
   end
 
   def intercept(link : Proc(T, Proc(T, Nil), Nil)) : Nil
@@ -26,19 +28,27 @@ class Plugboard::Topic(T)
   end
 
   def listen(listener : T -> Nil) : Nil
-    @listeners = @listeners + [listener]
+    @listeners.add(listener)
   end
 
   def unlisten(listener : T -> Nil) : Nil
-    @listeners = @listeners.reject { |entry| entry == listener }
+    @listeners.remove(listener)
   end
 
   def handle(handler : T -> Bool) : Nil
-    @handlers = @handlers + [handler]
+    @handlers.add(handler)
   end
 
   def unhandle(handler : T -> Bool) : Nil
-    @handlers = @handlers.reject { |entry| entry == handler }
+    @handlers.remove(handler)
+  end
+
+  def observe(observer : T, Bool -> Nil) : Nil
+    @observers.add(observer)
+  end
+
+  def unobserve(observer : T, Bool -> Nil) : Nil
+    @observers.remove(observer)
   end
 
   def emit(event : T) : Bool
@@ -47,9 +57,14 @@ class Plugboard::Topic(T)
 
   def deliver(event : T) : Bool
     @listeners.each(&.call(event))
+    taken = false
     @handlers.each do |handler|
-      return true if handler.call(event)
+      if handler.call(event)
+        taken = true
+        break
+      end
     end
-    false
+    @observers.each(&.call(event, taken))
+    taken
   end
 end

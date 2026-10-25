@@ -9,6 +9,12 @@ module Plugboard
     {% end %}
   end
 
+  macro registered!(type)
+    \{% for member in ({{type}}.union? ? {{type}}.union_types : [{{type}}]) %}
+      \{% raise "plugboard: #{member} is not a registered event; add `Plugboard.events #{member}`" unless ::Plugboard::EVENT_TYPES.includes?(member) %}
+    \{% end %}
+  end
+
   macro finished
     alias Event = Union({{ ::Plugboard::EVENT_TYPES.splat }})
   end
@@ -33,26 +39,10 @@ module Plugboard
   end
 
   struct FlushEvent
-    getter? final : Bool
+    getter? final    : Bool
+    getter? rendered : Bool
 
-    def initialize(@final : Bool = false)
-    end
-  end
-
-  abstract class Message
-  end
-
-  struct MessageEvent
-    getter message : Message
-
-    def initialize(@message : Message)
-    end
-  end
-
-  class AsyncError < Message
-    getter error : Exception
-
-    def initialize(@error : Exception)
+    def initialize(*, @final : Bool = false, @rendered : Bool = false)
     end
   end
 
@@ -69,5 +59,5 @@ module Plugboard
     end
   end
 
-  events IdleEvent, RenderEvent, FlushEvent, StoppedEvent, MessageEvent, ErrorEvent
+  events IdleEvent, RenderEvent, FlushEvent, StoppedEvent, ErrorEvent
 end
