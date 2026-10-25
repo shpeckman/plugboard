@@ -18,26 +18,61 @@ module Plugboard
 
   macro service(declaration)
     {% type = declaration.type.resolve %}
+    {% name = declaration.var %}
 
     class ::Plugboard::App
-      @{{declaration.var}} : {{type}}?
+      @{{name}} : {{type}}?
 
-      def {{declaration.var}} : {{type}}
-        @{{declaration.var}} ||= begin
+      def {{name}} : {{type}}
+        @{{name}} ||= begin
           service = root.plugin({{type}})
-          service.ctx.effect { -> { @{{declaration.var}} = nil } }
+          service.ctx.defer { @{{name}} = nil }
           service
         end
       end
 
-      def {{declaration.var}}? : {{type}}?
-        @{{declaration.var}}
+      def {{name}}? : {{type}}?
+        @{{name}}
       end
     end
 
-    class ::Plugboard::Context
-      def {{declaration.var}} : {{type}}
-        @app.{{declaration.var}}
+    ::Plugboard.scoped({{name}}, {{type}})
+  end
+
+  macro slot(declaration)
+    {% type = declaration.type.resolve %}
+    {% name = declaration.var %}
+
+    class ::Plugboard::App
+      @{{name}} : {{type}}?
+
+      def {{name}} : {{type}}
+        @{{name}} || raise "plugboard: no {{type}} is attached as {{name}}"
+      end
+
+      def {{name}}? : {{type}}?
+        @{{name}}
+      end
+
+      def {{name}}=(value : {{type}}?) : {{type}}?
+        {% if type < ::Plugboard::Plugin %}
+          value.try { |item| item.ctx.defer { @{{name}} = nil if @{{name}}.same?(item) } }
+        {% end %}
+        @{{name}} = value
+      end
+    end
+
+    ::Plugboard.scoped({{name}}, {{type}})
+  end
+
+  macro scoped(name, type)
+    module ::Plugboard::Scope
+      def {{name}} : {{type}}
+        scope.app.{{name}}
+      end
+
+      def {{name}}? : {{type}}?
+        scope.app.{{name}}?
       end
     end
   end

@@ -1,5 +1,5 @@
-# src/plugboard/disposable/session.cr
-class Plugboard::Session
+# src/plugboard/disposable/run_scope.cr
+class Plugboard::RunScope
   include Disposable
 
   @undo : (-> Nil)?

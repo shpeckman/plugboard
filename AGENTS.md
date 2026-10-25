@@ -17,25 +17,44 @@ dependencies.
 shard.yml                         shard metadata; no dependencies
 src/plugboard.cr                  entry point; requires sync and every module
 src/plugboard/fault.cr            Fault: an error raised when a second failure follows the first
-src/plugboard/event.cr            Plugboard.events macro, Event union, built-in events, Message, Quiet, Action
+src/plugboard/event.cr            Plugboard.events and registered! macros, Event union, built-in events, Quiet, Action
 src/plugboard/bus.cr              Bus: one Topic per registered type, untyped gate chain, deliver
-src/plugboard/topic.cr            Topic(T): interceptor chain, listeners, handlers
+src/plugboard/roster.cr           Roster(T): copy-on-write list behind topics and chains
+src/plugboard/topic.cr            Topic(T): interceptor chain, listeners, handlers, observers
 src/plugboard/chain.cr            Chain(T): middleware pipeline with prebuilt next-procs
-src/plugboard/context.cr          Context: ownership scope, registration methods, typed async, own/disown/dispose
-src/plugboard/app.cr              App: run loop, queues, sessions, flush events, error reporting
+src/plugboard/scope.cr            Scope: the registration API (nest, plugin, effect, defer, while_running, on, handle, observe, intercept, timers, async, hold_render), shared by Context and App
+src/plugboard/context.cr          Context: ownership scope, own/disown/dispose
+src/plugboard/plugin.cr           Plugin base class; service, slot and scoped macros
+src/plugboard/app.cr              App: run loop, queues, run scopes, job dispatch, render holds, flush events, error reporting
 src/plugboard/timer.cr            Timer and Timers (indexed binary min-heap)
-src/plugboard/disposable.cr       Disposable module and its slot
+src/plugboard/disposable.cr       Disposable module and its held_index
 src/plugboard/token.cr            Token: atomic cancellation flag handed to async work
-src/plugboard/disposable/effect.cr   Effect: one-shot undo
-src/plugboard/disposable/session.cr  Session: setup/undo tied to the run loop
+src/plugboard/disposable/effect.cr     Effect: one-shot undo
+src/plugboard/disposable/run_scope.cr  RunScope: setup/undo tied to the run loop
+src/plugboard/disposable/job.cr        Job: the lease of one async job, with its Token
 spec/spec_helper.cr               requires spec and the shard
 spec/plugboard_spec.cr            the spec suite
 README.md                         usage and public API reference
 AGENTS.md                         this file
 ```
 
-`topic.cr` and `chain.cr` have no dependency on `Bus`, `Event` or
-`EVENT_TYPES`. Both are reusable on their own, so keep them that way.
+`roster.cr`, `topic.cr` and `chain.cr` have no dependency on `Bus`, `Event` or
+`EVENT_TYPES`. They are reusable on their own, so keep them that way.
+
+## Scope and the app
+
+Every registration method lives once, in `Plugboard::Scope`, written against
+the abstract `scope : Context`. `Context#scope` is `self`; `App#scope` is
+`root`. `App` defines `emit`, `post` and `invalidate` itself, which take
+precedence over the `Scope` versions that forward to `scope.app`. Never add a
+registration method to `App` or `Context` directly; add it to `Scope`, and an
+extension shard reopens `Scope` the same way. `App#app` returns `self` so
+`scope.app` reads the same on both.
+
+`service` and `slot` define the instance on `App` and call `scoped`, which
+adds the forwarding pair to `Scope`. A slot whose type is a `Plugin` defers a
+clear on the attached plugin's context, guarded by `same?` so replacing the
+instance first keeps the new one.
 
 ## Commands
 
@@ -54,13 +73,25 @@ leave the checks on everywhere.
 
 ## Flushing
 
-`App#run` emits `FlushEvent` straight to its topic after `start_sessions`, at
-the end of every pass (after `render`), and once more with `final: true` after
-`StoppedEvent` in `shutdown`. It is not guarded: an exception from a listener
-unwinds the loop, because a failed write is fatal. Rendering is never deferred
-by the kernel; a program that paces frames to its output intercepts
-`RenderEvent`, calls `invalidate` and wakes the loop with `enqueue` when its
-write lands.
+`App#run` emits `FlushEvent` straight to its topic after `start_runs`, at
+the end of every pass (after `render`, carrying whether it rendered), and once
+more with `final: true` after `StoppedEvent` in `shutdown`. It is not guarded:
+an exception from a listener unwinds the loop, because a failed write is fatal.
+
+## Rendering
+
+`@dirty` is an `Atomic(Bool)` so `wake(dirty: true)` can set it from any fiber
+before ringing. Loop-side writes (`emit`, `invalidate`) use relaxed ordering;
+`render` takes it with `swap(false)`. `@holds` is a loop-only counter behind
+`hold_render`: while it is positive `render` returns early and leaves the flag
+set. `release_renders` rings when the count reaches zero and the app is dirty,
+because a release in a `FlushEvent` listener lands after this pass's render.
+
+## Lifecycle
+
+`run` leaves every registration installed so it can run again. `App#dispose`
+stops a running loop, drops `@root` and disposes it; the next `root` call
+builds a fresh scope.
 
 ## Concurrency and ownership
 
@@ -109,13 +140,13 @@ elsewhere, and compiles to nothing without `-Dplugboard_assert`. Every loop-only
 method on `App` and `Context` calls it. Add the call when you add such a method.
 
 **Workers.** `App#workers` is a `Fiber::ExecutionContext::Parallel` sized to
-`Fiber::ExecutionContext.default_workers_count` that `async` spawns into, so a
+`Fiber::ExecutionContext.default_workers_count` that `dispatch` spawns into, so a
 block that holds its thread stalls neither the loop nor other workers. Workers
-reach the loop only through `post`/`enqueue`, so nothing of the kernel's needs a
+reach the loop only through `post`/`enqueue`/`wake`, so nothing of the kernel's needs a
 lock; work that shares state with other work must protect it itself. Never spawn
 kernel work with bare `spawn` — it would land in the loop's own context.
 
-It is built on first use, under `@mutex` because `async` may be called from any
+It is built on first use, under `@mutex` because `workers` may be called from any
 fiber, and **not** in the constructor. Constructing an execution context is not
 free: it carries its own event loop and so costs file descriptors (an epoll
 descriptor and an eventfd on Linux) from the moment it exists, even though no
@@ -123,35 +154,46 @@ thread starts until something is spawned into it. An eager context per app
 exhausts the descriptor table in any suite that builds an app per example — tui's
 did, at around 190. Keep it lazy.
 
-**Typed async.** `Context#async(work, &done)` keeps its cancel flag as a plain
-closured `Bool`, not an `Atomic`, because only the loop fiber touches it: the
-undo step writes it and the enqueued reply reads it. The worker fiber only
+**Async.** Every `Scope#async` form builds a `Job` owned by the scope and hands
+it to `App#dispatch`, which skips a job that is already dead, counts it in
+`@jobs` and spawns the work on `workers`. The job's live flag is a plain `Bool`,
+not an `Atomic`, because only the loop fiber touches it: `dispose` writes it and
+the enqueued reply reads it through `finish` or `fail`. The worker fiber only
 produces the value. That value crosses contexts inside the closure handed to
 `enqueue`, so it is published through the queue's mutex and needs no
 synchronisation of its own. Contrast `Timer#cancel`, which does need an
 `Atomic` because `cancelled?` must be truthful the instant it returns from any
-fiber. A failure is re-raised inside the enqueued reply rather than passed to
-`report` directly, so the loop's `guard` reports it exactly once.
+fiber. A failure is re-raised inside the enqueued `fail` rather than passed to
+`report` directly, so the loop's `guard` reports it exactly once. A finished
+job disposes itself through `finish`, which releases its place in the scope.
 
-**Cancellation.** `Context#async(work : Proc(Token, T))` is the primary form;
-the `Proc(T)` form wraps it. The lease's undo step flips `live` (loop-only, a
-plain `Bool`) and cancels the `Token` (an `Atomic(Bool)`, because the worker
-reads it from another thread).
+**Cancellation.** `Job#dispose` cancels its `Token` (an `Atomic(Bool)`, because
+the worker reads it from another thread). The `Proc(T)` form wraps the
+`Proc(Token, T)` form.
 
-**Known costs.** `App#detach` is an `Array#delete`, O(n) in the session
-count, which is always small; leave it.
+**Known costs.** `App#detach` is an `Array#delete`, O(n) in the run scope
+count, which is always small; leave it. `Roster#add` and `#remove` copy the
+array so a dispatch in progress keeps its snapshot; registration is rare next to
+delivery.
 
-**Held items and slots.** `Disposable` carries `slot`, the item's index in its
-owner's `@held`, or `-1`. `own` sets it; `disown` checks that `@held[slot]` is
+**Held items.** `Disposable` carries `held_index`, the item's index in its
+owner's `@held`, or `-1`. `own` sets it, after a compile-time check that the
+type includes `Disposable`; `disown` checks that `@held[held_index]` is
 the same object, then leaves a `nil` hole there instead of shifting or
 swapping, so removal is O(1) and the survivors keep their order — teardown must
 stay newest first, which rules out swap-removal. `@holes` counts the gaps;
-`compact` squeezes them out and renumbers every slot once they outnumber the
+`compact` squeezes them out and renumbers every index once they outnumber the
 live items, keeping it amortized O(1). `dispose` pops from the end, skips
-holes, and resets each item's slot before disposing it. One slot per item means
-an item can have only one owner at a time.
+holes, and resets each item's index before disposing it. One index per item
+means an item can have only one owner at a time.
 
-**Consumption.** `Topic#deliver` returns whether a handler took the event, and
+**Registration.** `App#emit` and `App#post` call `Plugboard.registered!(T)`,
+which fails compilation for a type, or union member, missing from
+`EVENT_TYPES`. It runs in a method body, where the list is complete.
+
+**Consumption.** `Topic#deliver` runs listeners, then handlers until one takes
+the event, then observers with that answer, and returns whether a handler took
+it, and
 `Chain#run` carries that back through its `@result` ivar because interceptor
 links return `Nil` and cannot propagate it. `Chain#run` saves and restores
 `@result` so a handler that re-emits the same type cannot corrupt the outer
